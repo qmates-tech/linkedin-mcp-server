@@ -4,6 +4,7 @@
  */
 
 import Database from 'better-sqlite3';
+import { chmodSync } from 'node:fs';
 import type { StoredToken } from '../types/index.js';
 
 export class TokenStore {
@@ -13,6 +14,13 @@ export class TokenStore {
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
+    // access/refresh tokens are stored in cleartext: keep the file owner-only.
+    // The 0700 data dir is the primary guard; this hardens copy/backup cases.
+    try {
+      chmodSync(dbPath, 0o600);
+    } catch {
+      // best-effort (e.g. non-POSIX); the enclosing dir mode still applies
+    }
     this.initialize();
   }
 

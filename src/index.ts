@@ -9,7 +9,7 @@ import 'dotenv/config';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { mkdirSync, existsSync } from 'node:fs';
+import { mkdirSync, chmodSync } from 'node:fs';
 import { createLinkedInMcpServer } from './server.js';
 import type { ServerConfig } from './types/index.js';
 import { SELF_SERVE_SCOPES } from './types/index.js';
@@ -29,11 +29,13 @@ function getConfig(): ServerConfig {
     process.exit(1);
   }
 
-  // Ensure data directory exists
+  // Ensure data directory exists.
+  // 0700: the token DB lives here in cleartext; keep it untraversable by other
+  // local accounts (also covers SQLite's world-readable -wal/-shm sidecars).
+  // chmod as well, to harden a dir an older version created at 0755.
   const dataDir = process.env.LINKEDIN_MCP_DATA_DIR ?? join(homedir(), '.linkedin-mcp');
-  if (!existsSync(dataDir)) {
-    mkdirSync(dataDir, { recursive: true });
-  }
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  chmodSync(dataDir, 0o700);
 
   return {
     linkedin: {

@@ -16,6 +16,33 @@ import type {
   InitializeUploadResponse,
 } from '../../types/index.js';
 
+const IMAGE_CONTENT_TYPES: Record<string, string> = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+};
+
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+
+/** Verify the bytes actually start with the signature of the claimed image type. */
+function isImageBytes(buf: Buffer, contentType: string): boolean {
+  if (buf.length < 12) return false;
+  switch (contentType) {
+    case 'image/jpeg':
+      return buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+    case 'image/png':
+      return buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+    case 'image/gif':
+      return buf.toString('ascii', 0, 3) === 'GIF';
+    case 'image/webp':
+      return buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP';
+    default:
+      return false;
+  }
+}
+
 export function registerPostingTools(
   server: McpServer,
   apiClient: LinkedInApiClient,
@@ -285,8 +312,34 @@ export function registerPostingTools(
     },
     async ({ imagePath }) => {
       try {
-        const { readFile } = await import('node:fs/promises');
-        const { extname } = await import('node:path');
+        const { readFile, stat, realpath } = await import('node:fs/promises');
+        const { extname, sep } = await import('node:path');
+
+        // Tool args are attacker-influenceable (prompt injection): confine the
+        // read so imagePath can't turn this tool into an arbitrary-file reader.
+        const realPath = await realpath(imagePath); // resolves symlinks
+        const imageRoot = process.env.LINKEDIN_MCP_IMAGE_DIR;
+        if (imageRoot) {
+          const realRoot = await realpath(imageRoot);
+          if (realPath !== realRoot && !realPath.startsWith(realRoot + sep)) {
+            throw new Error('imagePath is outside LINKEDIN_MCP_IMAGE_DIR');
+          }
+        }
+
+        const contentType = IMAGE_CONTENT_TYPES[extname(realPath).toLowerCase()];
+        if (!contentType) {
+          throw new Error(`Unsupported image type: ${extname(realPath) || '(none)'}`);
+        }
+
+        const { size } = await stat(realPath);
+        if (size > MAX_IMAGE_BYTES) {
+          throw new Error(`Image too large: ${size} bytes (max ${MAX_IMAGE_BYTES})`);
+        }
+
+        const imageData = await readFile(realPath);
+        if (!isImageBytes(imageData, contentType)) {
+          throw new Error('File content is not a valid image');
+        }
 
         const userId = await getUserId();
         const ownerUrn = `urn:li:person:${userId}`;
@@ -301,18 +354,7 @@ export function registerPostingTools(
 
         const { uploadUrl, image: imageUrn } = initResponse.value;
 
-        // Step 2: Upload the binary data
-        const imageData = await readFile(imagePath);
-        const ext = extname(imagePath).toLowerCase();
-        const contentTypeMap: Record<string, string> = {
-          '.jpg': 'image/jpeg',
-          '.jpeg': 'image/jpeg',
-          '.png': 'image/png',
-          '.gif': 'image/gif',
-          '.webp': 'image/webp',
-        };
-        const contentType = contentTypeMap[ext] ?? 'image/jpeg';
-
+        // Step 2: Upload the validated binary data
         await apiClient.uploadBinary(uploadUrl, imageData, contentType);
 
         return {
