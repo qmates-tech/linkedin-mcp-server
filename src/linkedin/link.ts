@@ -93,7 +93,16 @@ export class LinkedInLink {
       throw new NotLinked('La chiave di cifratura non apre più il tuo collegamento: ricollega con linkedin_link_start.');
     }
     if (!readout.needsRenewal && !afterRejection) return readout.accessToken;
-    if (readout.refreshToken === null) throw new LinkNoLongerValid();
+    if (readout.refreshToken === null) {
+      // Due cause diverse, e vanno dette diverse: qui il token e' scaduto e non
+      // c'e' nulla con cui rinnovarlo — LinkedIn concede il refresh token solo
+      // alle app abilitate, e senza quello un access token dura due mesi e poi
+      // si ricollega. Dire «LinkedIn ha ritirato l'accesso» manderebbe ogni
+      // QMate, ogni sessanta giorni, a cercare una revoca che non c'e' stata.
+      throw new LinkNoLongerValid(
+        'Il collegamento con LinkedIn e scaduto e non e rinnovabile da qui: ricollega con linkedin_link_start.',
+      );
+    }
     return this.renewOnce(readout.refreshToken);
   }
 

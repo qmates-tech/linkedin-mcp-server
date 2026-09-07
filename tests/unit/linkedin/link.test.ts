@@ -143,7 +143,21 @@ describe('il bearer verso LinkedIn', () => {
   it('dice che il grant è finito se LinkedIn rifiuta il rinnovo', async () => {
     renew.mockResolvedValue(null);
     store.rememberLink(FABRIZIO, HIS_MEMBER, credential({ accessExpiresAt: NOW + 1000 }), NOW);
-    await expect(links.of(FABRIZIO).accessToken()).rejects.toBeInstanceOf(LinkNoLongerValid);
+    await expect(links.of(FABRIZIO).accessToken()).rejects.toThrow(/ritirato/);
+  });
+
+  // LinkedIn concede il refresh token solo alle app abilitate. Senza, un access
+  // token dura due mesi e poi si ricollega: e' il caso che capitera' a ogni
+  // QMate ogni sessanta giorni, e non e' una revoca.
+  it('distingue «scaduto e non rinnovabile» da «LinkedIn ha ritirato l accesso»', async () => {
+    store.rememberLink(
+      FABRIZIO,
+      HIS_MEMBER,
+      credential({ refreshToken: undefined, accessExpiresAt: NOW + 1000 }),
+      NOW,
+    );
+    await expect(links.of(FABRIZIO).accessToken()).rejects.toThrow(/scaduto e non e rinnovabile/);
+    expect(renew).not.toHaveBeenCalled();
   });
 
   it('e anche se non c è un refresh token da usare', async () => {
