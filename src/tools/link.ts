@@ -106,6 +106,19 @@ export function registerLinkTools(
             puoiPubblicare: state.summary.scopes.includes('w_member_social'),
             accessoValidoFino: new Date(state.summary.accessExpiresAt).toISOString(),
             collegatoIl: new Date(state.summary.linkedAt).toISOString(),
+            // Il preavviso esiste perché la differenza è tutta nel tempismo:
+            // rifare il collegamento MENTRE il token è ancora vivo salta la
+            // schermata di consenso di LinkedIn — è un redirect e nulla più —
+            // mentre farlo dopo la scadenza la ripropone per intero. E il
+            // vecchio token continua a funzionare fino alla sua scadenza, quindi
+            // ricollegarsi in anticipo non costa niente.
+            ...(state.expiringWithinDays === null
+              ? {}
+              : {
+                  scadeFraGiorni: state.expiringWithinDays,
+                  cosaFare:
+                    'Ricollega ora con linkedin_link_start: finché il collegamento è vivo, LinkedIn non ti richiede il consenso e quello attuale continua a funzionare.',
+                }),
           });
         }
         if (state.kind === 'awaiting_confirmation') {

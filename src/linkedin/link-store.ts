@@ -22,12 +22,29 @@ const CONFIRMATION_WINDOW_MS = 10 * 60 * 1000;
 const MOST_CONFIRMATION_ATTEMPTS = 10;
 /** Si rinnova l'access token un po' prima della scadenza, non sul filo. */
 const RENEW_BEFORE_MS = 5 * 60 * 1000;
+/**
+ * Da quanto prima conviene DIRLO al QMate, che è un'altra cosa dal rinnovare.
+ *
+ * LinkedIn concede il refresh token solo alle app abilitate. Senza, l'unico
+ * rinnovo è rimandare il QMate su `/oauth/v2/authorization` — e quel giro salta
+ * la schermata di consenso solo **finché il token corrente è ancora vivo**.
+ * Ricollegarsi in anticipo è quindi silenzioso, e ricollegarsi in ritardo
+ * significa rivedere il consenso: la differenza la fa saperlo prima, non un
+ * meccanismo.
+ */
+const SAY_IT_BEFORE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface LinkedInCredential {
   accessToken: string;
   refreshToken?: string;
   scopes: string[];
   accessExpiresAt: number;
+  /**
+   * Si persiste e NON si legge, di proposito: LinkedIn lo documenta in secondi
+   * ma i suoi esempi valgono minuti (525600 accanto a un `expires_in` di 86400).
+   * Finché non lo si verifica su una risposta vera, farci una decisione sopra
+   * significa scegliere fra due letture che differiscono di sessanta volte.
+   */
   refreshExpiresAt?: number;
 }
 
@@ -48,7 +65,12 @@ export type LinkReadout =
       readonly summary: LinkSummary;
       readonly accessToken: string;
       readonly refreshToken: string | null;
+      /** Dentro la finestra in cui si prova a rinnovare, se c'è con cosa. */
       readonly needsRenewal: boolean;
+      /** Scaduto davvero: qui il token non vale più, con o senza refresh. */
+      readonly expired: boolean;
+      /** Entro quanti giorni scade, per dirlo al QMate mentre è ancora silenzioso. */
+      readonly expiringWithinDays: number | null;
     };
 
 export interface ConsentedLink {
@@ -146,6 +168,11 @@ export class LinkStore {
         ? unseal(this.tokenKey, row.refresh_token_sealed, qmate)
         : null,
       needsRenewal: now >= row.access_expires_at - RENEW_BEFORE_MS,
+      expired: now >= row.access_expires_at,
+      expiringWithinDays:
+        now >= row.access_expires_at - SAY_IT_BEFORE_MS
+          ? Math.max(0, Math.ceil((row.access_expires_at - now) / (24 * 60 * 60 * 1000)))
+          : null,
     };
   }
 

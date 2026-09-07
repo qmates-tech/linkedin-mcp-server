@@ -28,7 +28,12 @@ export type LinkState =
   | { readonly kind: 'awaiting_confirmation'; readonly linkedInMemberId: string }
   /** Il sigillo non si apre più: per il QMate equivale a non essere collegato. */
   | { readonly kind: 'unreadable'; readonly linkedInMemberId: string }
-  | { readonly kind: 'linked'; readonly summary: LinkSummary };
+  | {
+      readonly kind: 'linked';
+      readonly summary: LinkSummary;
+      /** Non nullo quando conviene ricollegarsi ora, mentre è ancora silenzioso. */
+      readonly expiringWithinDays: number | null;
+    };
 
 /**
  * La fabbrica condivisa. Tiene i rinnovi in volo, che devono essere per
@@ -62,7 +67,13 @@ export class LinkedInLink {
 
   state(): LinkState {
     const readout = this.store.linkOf(this.forQMate, this.now());
-    if (readout.kind === 'linked') return { kind: 'linked', summary: readout.summary };
+    if (readout.kind === 'linked') {
+      return {
+        kind: 'linked',
+        summary: readout.summary,
+        expiringWithinDays: readout.expiringWithinDays,
+      };
+    }
     if (readout.kind === 'unreadable') {
       return { kind: 'unreadable', linkedInMemberId: readout.linkedInMemberId };
     }
@@ -93,6 +104,13 @@ export class LinkedInLink {
       throw new NotLinked('La chiave di cifratura non apre più il tuo collegamento: ricollega con linkedin_link_start.');
     }
     if (!readout.needsRenewal && !afterRejection) return readout.accessToken;
+    if (readout.refreshToken === null && !readout.expired && !afterRejection) {
+      // Non c'è nulla da rinnovare, quindi la finestra di rinnovo non vuol dire
+      // niente: il token vale fino alla scadenza vera, e rifiutarlo cinque
+      // minuti prima non protegge nessuno e blocca un QMate che potrebbe
+      // ancora lavorare.
+      return readout.accessToken;
+    }
     if (readout.refreshToken === null) {
       // Due cause diverse, e vanno dette diverse: qui il token e' scaduto e non
       // c'e' nulla con cui rinnovarlo — LinkedIn concede il refresh token solo

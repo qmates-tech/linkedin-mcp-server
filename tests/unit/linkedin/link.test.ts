@@ -55,6 +55,20 @@ describe('lo stato del collegamento', () => {
     });
   });
 
+  // Rifare il collegamento mentre il token e' vivo salta il consenso di
+  // LinkedIn; farlo dopo la scadenza lo ripropone. Il preavviso e' quindi
+  // l'unica cosa che rende la differenza visibile a chi deve agire.
+  it('avvisa quando la scadenza si avvicina, e sta zitto quando e lontana', () => {
+    const sessantaGiorni = 60 * 24 * 3600 * 1000;
+    store.rememberLink(FABRIZIO, HIS_MEMBER, credential({ accessExpiresAt: NOW + sessantaGiorni }), NOW);
+    const lontana = links.of(FABRIZIO).state();
+    expect(lontana.kind === 'linked' && lontana.expiringWithinDays).toBeNull();
+
+    store.rememberLink(FABRIZIO, HIS_MEMBER, credential({ accessExpiresAt: NOW + 3 * 24 * 3600 * 1000 }), NOW);
+    const vicina = links.of(FABRIZIO).state();
+    expect(vicina.kind === 'linked' && vicina.expiringWithinDays).toBe(3);
+  });
+
   it('è collegato dopo una conferma', () => {
     store.rememberLink(FABRIZIO, HIS_MEMBER, credential(), NOW);
     const state = links.of(FABRIZIO).state();
@@ -153,21 +167,30 @@ describe('il bearer verso LinkedIn', () => {
     store.rememberLink(
       FABRIZIO,
       HIS_MEMBER,
-      credential({ refreshToken: undefined, accessExpiresAt: NOW + 1000 }),
+      credential({ refreshToken: undefined, accessExpiresAt: NOW - 1 }),
       NOW,
     );
     await expect(links.of(FABRIZIO).accessToken()).rejects.toThrow(/scaduto e non e rinnovabile/);
     expect(renew).not.toHaveBeenCalled();
   });
 
-  it('e anche se non c è un refresh token da usare', async () => {
+  // Senza refresh token la finestra di rinnovo non vuol dire niente: non c'è
+  // nulla da rinnovare, e rifiutare un token ancora valido bloccherebbe un
+  // QMate che potrebbe lavorare per altri cinque minuti.
+  it('usa il token fino alla scadenza VERA quando non c è nulla da rinnovare', async () => {
     store.rememberLink(
       FABRIZIO,
       HIS_MEMBER,
       credential({ refreshToken: undefined, accessExpiresAt: NOW + 1000 }),
       NOW,
     );
-    await expect(links.of(FABRIZIO).accessToken()).rejects.toBeInstanceOf(LinkNoLongerValid);
+    await expect(links.of(FABRIZIO).accessToken()).resolves.toBe('access-corrente');
+    expect(renew).not.toHaveBeenCalled();
+  });
+
+  it('ma lo rifiuta se LinkedIn lo ha appena rifiutato, che il clock non lo sa', async () => {
+    store.rememberLink(FABRIZIO, HIS_MEMBER, credential({ refreshToken: undefined }), NOW);
+    await expect(links.of(FABRIZIO).accessToken(true)).rejects.toBeInstanceOf(LinkNoLongerValid);
   });
 });
 
