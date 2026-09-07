@@ -6,9 +6,12 @@ import express, { type Express, type NextFunction, type Request, type Response }
 
 import { actingQMate, type QMateSubject } from './fleet/acting-qmate.js';
 import {
+  LINKEDIN_CALLBACK_PATH,
   PROTECTED_RESOURCE_METADATA_PATH,
   type ServiceConfiguration,
 } from './fleet/configuration.js';
+import { awaitingConfirmationPage, consentRefusedPage } from './linkedin/consent-page.js';
+import type { Linking } from './linkedin/linking.js';
 
 /**
  * Il corpo di una chiamata MCP è piccolo, tranne quando porta un'immagine in
@@ -19,6 +22,7 @@ const LARGEST_MCP_BODY = '12mb';
 export interface ServiceDependencies {
   configuration: ServiceConfiguration;
   verifier: OAuthTokenVerifier;
+  linking: Linking;
   /**
    * Un `McpServer` per richiesta, col QMate già legato.
    *
@@ -31,7 +35,12 @@ export interface ServiceDependencies {
   mcpServerFor: (qmate: QMateSubject) => McpServer;
 }
 
-export function buildService({ configuration, verifier, mcpServerFor }: ServiceDependencies): Express {
+export function buildService({
+  configuration,
+  verifier,
+  linking,
+  mcpServerFor,
+}: ServiceDependencies): Express {
   const service = express();
   service.disable('x-powered-by');
   // Dietro l'edge il socket remoto è sempre Caddy, quindi senza questo `req.ip`
@@ -63,6 +72,25 @@ export function buildService({ configuration, verifier, mcpServerFor }: ServiceD
   // `https://host` e `https://host/mcp` sono due risorse.
   service.get(PROTECTED_RESOURCE_METADATA_PATH, (_request, response) => {
     response.json(protectedResource);
+  });
+
+  // L'unico endpoint anonimo del servizio, e non ha bisogno di un tetto sulle
+  // richieste: uno `state` mai emesso viene rifiutato da una lettura di indice,
+  // prima di qualunque chiamata verso LinkedIn. Il costo per chi tira a
+  // indovinare è quello di una query, non quello di un round-trip in uscita.
+  service.get(LINKEDIN_CALLBACK_PATH, async (request, response) => {
+    // Il codice di conferma non deve finire in nessuna cache: né del browser,
+    // né di un proxy che qualcuno metterà davanti un giorno.
+    response.set('cache-control', 'no-store');
+    response.type('html');
+    const outcome = request.query.error
+      ? ({ kind: 'refused' } as const)
+      : await linking.consentArrived(request.query.state, request.query.code);
+    if (outcome.kind !== 'awaiting_confirmation') {
+      response.status(400).send(consentRefusedPage());
+      return;
+    }
+    response.send(awaitingConfirmationPage(outcome.confirmationCode, outcome.memberName));
   });
 
   const requireQMate = requireBearerAuth({

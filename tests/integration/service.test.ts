@@ -6,8 +6,14 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import type { QMateSubject } from '../../src/fleet/acting-qmate.js';
-import { PROTECTED_RESOURCE_METADATA_PATH, type ServiceConfiguration } from '../../src/fleet/configuration.js';
+import {
+  LINKEDIN_CALLBACK_PATH,
+  PROTECTED_RESOURCE_METADATA_PATH,
+  type ServiceConfiguration,
+} from '../../src/fleet/configuration.js';
 import { IntrospectionVerifier } from '../../src/fleet/introspection.js';
+import { LinkStore } from '../../src/linkedin/link-store.js';
+import { Linking } from '../../src/linkedin/linking.js';
 import { buildService } from '../../src/service.js';
 
 const OUR_RESOURCE = 'https://mcp-linkedin.qmates.tech';
@@ -44,8 +50,27 @@ function farFuture(): number {
   return Math.floor(Date.now() / 1000) + 3600;
 }
 
+const store = new LinkStore(':memory:', Buffer.alloc(32, 3));
+
+/** Un LinkedIn finto che consente sempre, con un nome ostile di proposito. */
+const linkedIn = async (url: string): Promise<Response> => {
+  const body = url.endsWith('/v2/userinfo')
+    ? { sub: 'membro-1', name: '<script>alert(1)</script> Machella' }
+    : { access_token: 'a', refresh_token: 'r', expires_in: 5_184_000, scope: 'openid' };
+  return new Response(JSON.stringify(body), { headers: { 'content-type': 'application/json' } });
+};
+
+const linking = new Linking({
+  store,
+  clientId: 'client-aziendale',
+  clientSecret: 'segreto-aziendale',
+  redirectUri: `${OUR_RESOURCE}${LINKEDIN_CALLBACK_PATH}`,
+  fetch: linkedIn as unknown as typeof globalThis.fetch,
+});
+
 const service = buildService({
   configuration,
+  linking,
   verifier: new IntrospectionVerifier({
     authorizationServer: THE_AS,
     resource: OUR_RESOURCE,
@@ -176,5 +201,53 @@ describe('metodi che questo servizio non serve', () => {
   it('dice 405 invece di 404, che somiglierebbe a un path sbagliato', async () => {
     const answer = await fetch(`${origin}/mcp`, { method: 'DELETE' });
     expect(answer.status).toBe(405);
+  });
+});
+
+describe('il callback di LinkedIn, l unico endpoint anonimo', () => {
+  it('mostra il codice e nomina chi si sta collegando', async () => {
+    const url = new URL(linking.beginLinking(A_QMATE as QMateSubject));
+    const state = url.searchParams.get('state')!;
+    const answer = await fetch(`${origin}${LINKEDIN_CALLBACK_PATH}?state=${state}&code=un-code`);
+    expect(answer.status).toBe(200);
+    const page = await answer.text();
+    expect(page).toMatch(/[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}/);
+    expect(page).toContain('non dare il codice a nessuno');
+  });
+
+  it('non fa cachare il codice a nessuno', async () => {
+    const url = new URL(linking.beginLinking(A_QMATE as QMateSubject));
+    const answer = await fetch(
+      `${origin}${LINKEDIN_CALLBACK_PATH}?state=${url.searchParams.get('state')}&code=c`,
+    );
+    expect(answer.headers.get('cache-control')).toContain('no-store');
+  });
+
+  // Il nome del membro arriva da LinkedIn: è testo di terzi.
+  it('non esegue il nome che LinkedIn restituisce', async () => {
+    const url = new URL(linking.beginLinking(A_QMATE as QMateSubject));
+    const page = await (
+      await fetch(`${origin}${LINKEDIN_CALLBACK_PATH}?state=${url.searchParams.get('state')}&code=c`)
+    ).text();
+    expect(page).not.toContain('<script>alert(1)</script>');
+    expect(page).toContain('&lt;script&gt;');
+  });
+
+  // Un endpoint anonimo che distingue i motivi dice a chi tira a indovinare
+  // quanto si è avvicinato.
+  it('rende la stessa pagina per ogni fallimento', async () => {
+    const stateMaiEmesso = await fetch(`${origin}${LINKEDIN_CALLBACK_PATH}?state=inventato&code=c`);
+    const consensoNegato = await fetch(
+      `${origin}${LINKEDIN_CALLBACK_PATH}?error=user_cancelled_login&state=x`,
+    );
+    const senzaParametri = await fetch(`${origin}${LINKEDIN_CALLBACK_PATH}`);
+    const stateRipetuto = await fetch(`${origin}${LINKEDIN_CALLBACK_PATH}?state=a&state=b&code=c`);
+    const pagine = await Promise.all(
+      [stateMaiEmesso, consensoNegato, senzaParametri, stateRipetuto].map((r) => r.text()),
+    );
+    expect([stateMaiEmesso, consensoNegato, senzaParametri, stateRipetuto].map((r) => r.status)).toEqual([
+      400, 400, 400, 400,
+    ]);
+    expect(new Set(pagine).size).toBe(1);
   });
 });
