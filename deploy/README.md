@@ -10,16 +10,12 @@ quel repo, e lo standard che il servizio rispetta in
 `auth.qmates.tech` per introspection. Ciò che tiene sono i collegamenti LinkedIn
 dei QMate — un token per `sub`, cifrato a riposo — e quelli sono suoi.
 
-## Cosa porta questo servizio
-
-| file | cosa fa |
-|---|---|
-| `../Dockerfile` | l'immagine, multi-stage, non-root, senza toolchain di build |
-| `docker-compose.yml` | il servizio sulla rete `fleet`, **senza `ports:`** |
-| `caddy/mcp-linkedin.caddy` | il frammento che pubblica `mcp-linkedin.qmates.tech` |
-| `env.mcp-linkedin.example` | il template di configurazione, uno solo e solo per questo servizio |
-| `../.github/workflows/ci.yml` | qualità + l'immagine `:<sha>` su GHCR |
-| `../.github/workflows/deploy.yml` | la messa in opera, a mano dal menu Actions |
+Richiede **Docker Compose ≥ 2.30** sul box: il compose usa la forma lunga di
+`env_file` con `format: raw`, e serve a impedire che Compose interpoli i VALORI
+dei segreti. Misurato: senza, un client secret che contenga un `$` arriva al
+container troncato, e uno che contenga `${HOME}` arriva con la home del runner
+dentro — con il file su disco perfettamente giusto. Una versione più vecchia
+rifiuta la chiave, che è il modo giusto di scoprirlo.
 
 ---
 
@@ -153,15 +149,43 @@ messa in opera è un atto umano esplicito. Il campo `image_tag` accetta uno sha 
 commit a 40 esadecimali per cui la CI ha già pubblicato l'immagine; vuoto = il
 commit del run.
 
-Il workflow, in ordine: valida lo sha → controlla mount e proprietario dei dati →
-controlla che nessun altro reclami l'hostname → apparecchia
-`~/.mcp-linkedin-deploy` → scrive il `.env` dai segreti → `pull` + `up -d` →
-aspetta `/healthz` dentro il container → `sudo fleet-publish-fragments` +
-`caddy reload` → verifica **dall'esterno** metadata, 401 e header di scoperta.
+Due ordini contano, e per un motivo:
+
+- l'hostname si reclama **dopo** che il servizio risponde. Il frammento entra
+  nella custodia solo a valle del cancello di salute, altrimenti un deploy
+  fallito lascerebbe una rivendicazione che il deploy di un **altro** repo
+  pubblicherebbe per noi — `fleet-publish-fragments` attraversa tutte le
+  custodie a ogni invocazione — puntando l'hostname a un container morto;
+- i controlli sul box (mount, proprietario, rete `fleet`, hostname libero) stanno
+  **prima** della scrittura del `.env`, così un prerequisito mancante non lascia
+  segreti in una custodia per un deploy che non partirà.
 
 **Non ribuilda mai.** Mette in opera l'immagine `:<sha>` che la CI ha già
 validato: un `build` nel deploy reintrodurrebbe la possibilità che il codice
 testato e quello in esecuzione divergano.
+
+### Tornare indietro
+
+`up -d` sostituisce il container prima che `/healthz` sia verificato, e con
+`restart: unless-stopped` un container che esce 78 per configurazione
+inutilizzabile va in crash-loop: da quel momento l'hostname risponde 502. Il
+rimedio è ripartire dallo sha precedente, che esiste su GHCR perché i tag sono
+per sha e nessuno li muove.
+
+```bash
+# lo sha in opera adesso
+docker inspect --format '{{.Config.Image}}' mcp-linkedin-deploy-mcp-linkedin-1
+
+# gli sha disponibili: la storia di master
+git log --format='%h %s' -20 master
+```
+
+Poi Actions → **deploy** → *Run workflow*, con `image_tag` = lo sha buono. Il
+frammento sull'edge non va toccato: punta al nome del container, non
+all'immagine, quindi resta valido attraverso un rollback.
+
+Se il guasto è nel `.env` e non nel codice, correggi il secret nell'Environment e
+rilancia il deploy sullo **stesso** sha: il `.env` si riscrive a ogni giro.
 
 ### Un presidio che vive fuori dai file
 
@@ -187,9 +211,15 @@ export MCP_LINKEDIN_IMAGE=ghcr.io/qmates-tech/mcp-linkedin:<sha>
 docker compose -p mcp-linkedin-deploy -f deploy/docker-compose.yml pull
 docker compose -p mcp-linkedin-deploy -f deploy/docker-compose.yml up -d
 
-# il frammento sull'edge, poi il reload
-sudo install -m 644 deploy/caddy/mcp-linkedin.caddy /srv/fleet/edge/services/
-docker exec edge-caddy-1 caddy reload --config /etc/caddy/Caddyfile
+# il frammento sull'edge, poi il reload — questi due DA ROOT: la regola sudoers
+# del runner concede solo /usr/local/bin/fleet-publish-fragments, quindi da
+# `ghrunner` l'install chiede una password che non esiste.
+install -m 644 deploy/caddy/mcp-linkedin.caddy /srv/fleet/edge/services/
+# La forma del contratto (infra/edge/services/README.md), dal repo della flotta:
+# il nome del container lo compone Compose dalla cartella da cui l'edge e' stato
+# avviato, quindi cablarlo qui e' un comando che smette di funzionare da solo.
+docker compose -f infra/edge/docker-compose.yml exec caddy \
+  caddy reload --config /etc/caddy/Caddyfile
 ```
 
 `install` diretto **scavalca** il controllo di collisione di
@@ -205,8 +235,10 @@ porta giù la flotta.
 
 ## Dopo il deploy: la checklist §8 dello standard
 
-Le prime tre le verifica già `deploy.yml` (step *Verifica pubblica*) e il run è
-rosso se non passano. Le altre si controllano una volta, qui.
+La salute (§6) e le prime **due** voci — la metadata e il 401 che la cita — le
+verifica `deploy.yml` dall'esterno, e il run è rosso se non passano. L'audience
+binding, che è la terza, NON la verifica: serve un token vero coniato per
+un'altra resource. Le altre si controllano una volta, qui.
 
 ```bash
 # [x] la resource dichiarata è quella giusta
@@ -234,18 +266,38 @@ docker run --rm --env-file /dev/null \
 #     ... tutti insieme, non il primo
 ```
 
-Restano due voci che non si provano con curl:
+### Le tre voci che curl non prova
 
-- **un token per un'altra resource è rifiutato** e **l'AS irraggiungibile fa
-  rifiutare, non accettare**: sono il comportamento fail-closed di
-  `IntrospectionVerifier`, coperto da `tests/unit/fleet/introspection.test.ts`
-  (`other_audience`, `as_unreachable`). Dal vivo si osserva sui log: manda un
-  bearer inventato e deve comparire una riga `"event":"bearer_refused"` con il
-  motivo, mentre al client arriva sempre la stessa frase — distinguere i motivi
-  nella risposta darebbe a un anonimo un oracolo sui token che non possiede.
-- **il `sub` autenticato è ciò che indicizza i dati**: si vede al primo
-  collegamento reale, quando un QMate collega LinkedIn e ritrova i propri post
-  (e solo i propri) alla sessione successiva.
+**Un token per un'altra resource è rifiutato.** È l'unico controllo che
+impedisce a un bearer coniato per `mcp-council` di entrare qui, quindi va
+guardato una volta, dal vivo. Serve un token vero per un'altra audience: fai un
+login MCP contro un altro servizio della flotta, prendi il suo bearer e
+presentalo qui.
+
+```bash
+curl -si -X POST https://mcp-linkedin.qmates.tech/mcp \
+  -H "authorization: Bearer <un token coniato per mcp-council>" \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{}}' | head -3
+# deve essere 401 — e nei log del servizio deve comparire
+#   {"event":"bearer_refused","refusal":"other_audience","aud":"https://mcp-council.qmates.tech"}
+```
+
+**L'AS irraggiungibile fa rifiutare, non accettare.** Coperto da
+`tests/unit/fleet/introspection.test.ts` (`as_unreachable`). Dal vivo si osserva
+sui log: al client arriva sempre la stessa frase, perché distinguere i motivi
+nella risposta darebbe a un anonimo un oracolo sui token che non possiede.
+
+**Nessun percorso locale nell'interfaccia dei tool.** Non è una voce da
+spuntare a mano: `tests/integration/tools.test.ts` legge gli schemi come li
+riceve un client (`listTools`, non il registro privato dell'SDK) e fallisce se
+un tool qualsiasi dichiara una proprietà il cui nome contiene `path`, `file`,
+`dir` o `filename`. È la lezione nata in questo repo — `imagePath` finiva in
+`readFile` — quindi il presidio sta nella CI e non in una checklist.
+
+**Il `sub` autenticato è ciò che indicizza i dati** si vede al primo
+collegamento reale, quando un QMate collega LinkedIn e ritrova i propri post — e
+solo i propri — alla sessione successiva.
 
 ---
 
@@ -258,6 +310,11 @@ docker compose -p mcp-linkedin-deploy \
   -f ~/.mcp-linkedin-deploy/docker-compose.yml logs --tail 60 mcp-linkedin
 ```
 
+Funziona senza sapere lo sha in opera: il deploy scrive un `.env` nella custodia
+con `MCP_LINKEDIN_IMAGE`, e Compose lo carica da sé dalla cartella del compose.
+Senza quel file ogni comando muore in interpolazione — `required variable
+MCP_LINKEDIN_IMAGE is missing a value` — prima di stampare qualsiasi cosa.
+
 ### Il container non sta su
 
 | nel log | significa | rimedio |
@@ -265,7 +322,8 @@ docker compose -p mcp-linkedin-deploy \
 | `configurazione inutilizzabile:` seguito da `QLI_… manca` | il `.env` non ha quel campo: manca il secret o la variabile nell'Environment `production` | depositalo e rilancia il deploy. Il messaggio elenca **tutti** i campi rotti, non il primo |
 | `QLI_TOKEN_KEY deve essere 32 byte in base64, ne ha N` | il secret è troncato o non è base64 | rigenera con `openssl rand -base64 32`, deposita con `printf` |
 | `QLI_RESOURCE_URL deve essere https` | la variabile punta a un `http://` non-loopback | correggi la variabile |
-| `SQLITE_CANTOPEN` in una riga `"event":"request_failed"` | `/srv/fleet/mcp-linkedin` non appartiene a uid 1000 | `install -d -o 1000 -g 1000 -m 700 /srv/fleet/mcp-linkedin` (vedi prerequisito 2) |
+| `SQLITE_CANTOPEN` **all'avvio**, senza che il servizio arrivi a rispondere | `/srv/fleet/mcp-linkedin` non è scrivibile da uid 1000. Il database si apre in `new LinkStore(...)` **prima** di mettersi in ascolto, quindi non esiste nessuna riga `request_failed` da cercare | `install -d -o 1000 -g 1000 -m 700 /srv/fleet/mcp-linkedin`, oppure rilancia `bootstrap.sh` (vedi prerequisito 2) |
+| `network fleet declared as external, but could not be found` | la rete della flotta non esiste: box ricostruito, o un `docker network prune` | rilancia `infra/provision/bootstrap.sh`. Il deploy lo controlla nel preflight, prima di scrivere il `.env` |
 
 ### Il container sta su, ma le chiamate MCP falliscono
 

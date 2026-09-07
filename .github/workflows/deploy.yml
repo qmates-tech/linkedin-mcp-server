@@ -105,6 +105,13 @@ jobs:
           # errore che parla di file, non di permessi. La assegna bootstrap.sh
           # (`own_data mcp-linkedin 1000`), DOPO il mount: assegnarla prima
           # toccherebbe la directory che il mount nasconde.
+          # La rete la crea bootstrap.sh. Se manca — box ricostruito, o un
+          # `docker network prune` — `up` muore DOPO che il .env con i segreti
+          # e' gia' stato scritto nella custodia.
+          if ! docker network inspect fleet >/dev/null 2>&1; then
+            echo "::error::la rete docker 'fleet' non esiste: rilancia infra/provision/bootstrap.sh"
+            exit 1
+          fi
           owner="$(stat -c '%u' "${DATA_DIR}")"
           if [ "${owner}" != "1000" ]; then
             echo "::error::${DATA_DIR} appartiene a uid ${owner}, non a 1000: rilancia infra/provision/bootstrap.sh, oppure da root sul box 'install -d -o 1000 -g 1000 -m 700 ${DATA_DIR}'"
@@ -138,6 +145,20 @@ jobs:
         with:
           ref: ${{ env.DEPLOY_REF }}
 
+      - name: Lo sha appartiene a master
+        # La restrizione dell'Environment vincola il REF del dispatch, non
+        # `image_tag`: senza questo cancello, un dispatch su master (quindi con
+        # i segreti di `production`) ma con lo sha di un branch qualsiasi monta
+        # QUELL'albero, e sono il suo frammento Caddy e il suo compose a finire
+        # nella custodia — cioe' sull'edge della flotta.
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=200 origin master
+          if ! git merge-base --is-ancestor "${DEPLOY_REF}" origin/master; then
+            echo "::error::${DEPLOY_REF} non e' un antenato di origin/master: si deploya solo cio' che e' passato da master"
+            exit 1
+          fi
+
       - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           registry: ghcr.io
@@ -166,7 +187,18 @@ jobs:
           install -d -m 700 "${stack}"
           install -m 644 deploy/docker-compose.yml "${stack}/docker-compose.yml"
           install -d -m 755 "${stack}/caddy"
-          install -m 644 "deploy/caddy/${FRAGMENT}" "${stack}/caddy/${FRAGMENT}"
+          # Il frammento arriva DOPO il cancello di salute: depositarlo qui
+          # lascerebbe, su un deploy fallito, una rivendicazione dell'hostname
+          # che il deploy di un ALTRO repo pubblicherebbe per noi — puntando a
+          # un container morto. `fleet-publish-fragments` attraversa tutte le
+          # custodie a ogni invocazione, non solo la propria.
+          #
+          # Il `.env` della project directory: Compose lo carica da se', quindi
+          # da qui `docker compose ps|logs|down` funzionano senza che l'operatore
+          # sappia lo sha. Senza, ogni comando muore in interpolazione su
+          # MCP_LINKEDIN_IMAGE prima di stampare qualsiasi cosa.
+          umask 077
+          printf 'MCP_LINKEDIN_IMAGE=%s\n' "${MCP_LINKEDIN_IMAGE}" > "${stack}/.env"
           echo "STACK=${stack}" >> "$GITHUB_ENV"
 
       - name: Materializza il .env nella custodia
@@ -252,9 +284,14 @@ jobs:
       - name: Pubblica sull'edge e ricarica
         run: |
           set -euo pipefail
+          # Ora che il servizio risponde, l'hostname si puo' reclamare.
+          install -m 644 "deploy/caddy/${FRAGMENT}" "${STACK}/caddy/${FRAGMENT}"
           # Comando fisso: la regola sudo del runner concede questo e solo questo.
           if ! sudo /usr/local/bin/fleet-publish-fragments; then
-            echo "::error::il pubblicatore ha rifiutato. Se nomina due custodie per ${FRAGMENT}, un altro repo reclama ancora ${SERVICE_HOST}: cancella il suo frammento."
+            # Il pubblicatore rifiuta anche per una collisione fra ALTRE custodie
+            # su un ALTRO frammento, e quando non trova nulla da pubblicare:
+            # interpretare qui manderebbe a cercare un conflitto che non esiste.
+            echo "::error::il pubblicatore ha rifiutato; la riga sopra nomina i frammenti contesi e le custodie. Se fra questi c'e' ${FRAGMENT}, un altro repo reclama ancora ${SERVICE_HOST}."
             exit 1
           fi
           # Il container si cerca per etichetta, non per nome: `edge-caddy-1` lo
@@ -262,9 +299,16 @@ jobs:
           # avviato, quindi un `-p` o una custodia diversa lo cambierebbero — e
           # il deploy risulterebbe verde con l'edge che serve ancora la vecchia
           # configurazione, cioe' 404 sul nostro hostname.
-          edge="$(docker ps --filter 'label=com.docker.compose.service=caddy' --format '{{.Names}}' | head -1)"
-          if [ -z "${edge}" ]; then
-            echo "::error::non trovo il container dell'edge (label com.docker.compose.service=caddy). Il frammento e' pubblicato ma l'edge non lo ha caricato: ricarica a mano."
+          # Anche il PROGETTO, non solo il servizio: `com.docker.compose.service=caddy`
+          # dice «un servizio Compose chiamato caddy», non «l'edge della flotta».
+          # Il giorno in cui un altro stack sul box ne porta uno, un `head -1`
+          # ricaricherebbe quello sbagliato, uscirebbe 0, e il deploy sarebbe
+          # verde con l'edge che serve ancora la configurazione precedente.
+          edge="$(docker ps --filter 'label=com.docker.compose.project=edge' \
+                            --filter 'label=com.docker.compose.service=caddy' \
+                            --format '{{.Names}}')"
+          if [ "$(printf '%s' "${edge}" | grep -c . || true)" -ne 1 ]; then
+            echo "::error::l'edge della flotta non e' identificabile (trovato: '${edge:-nulla}'). Il frammento e' pubblicato ma non caricato: ricarica a mano dal repo qmates-mcp-fleet con 'docker compose -f infra/edge/docker-compose.yml exec caddy caddy reload --config /etc/caddy/Caddyfile'."
             exit 1
           fi
           # Caddy valida prima di applicare: un frammento rotto fa fallire il
@@ -292,9 +336,15 @@ jobs:
           # se non combacia con la voce di QAS_AUDIENCES, il login riesce e ogni
           # chiamata MCP torna 401 — il guasto più noioso da diagnosticare della
           # flotta, e quello che si paga a login già fatto.
+          #
+          # Si confronta la forma CANONICA: il servizio pubblica cio' che
+          # `canonicalResource` rende, quindi uno slash finale o una maiuscola
+          # nella variabile renderebbero rosso un deploy corretto — e lo
+          # renderebbero rosso DOPO che l'edge e' stato pubblicato.
+          atteso="$(printf '%s' "${QLI_RESOURCE_URL}" | tr '[:upper:]' '[:lower:]' | sed 's:/*$::')"
           case "${metadata}" in
-            *"\"resource\":\"${QLI_RESOURCE_URL}\""*) ;;
-            *) echo "::error::la metadata RFC 9728 non dichiara ${QLI_RESOURCE_URL}. Ha risposto: ${metadata}"; exit 1;;
+            *"\"resource\":\"${atteso}\""*) ;;
+            *) echo "::error::la metadata RFC 9728 non dichiara ${atteso}. Ha risposto: ${metadata}"; exit 1;;
           esac
 
           anonima="$(curl -sS -i -X POST --max-time 15 "https://${SERVICE_HOST}/mcp" \
@@ -315,3 +365,20 @@ jobs:
             exit 1
           fi
           echo "metadata, 401 e header di scoperta a posto"
+
+      - name: Fai spazio
+        # Ogni deploy scarica un'immagine nuova taggata per sha e nessuno ne
+        # cancella mai una, su un filesystem che non ha un LV proprio:
+        # /var/lib/docker sta sul root fs, e questa immagine e' qualche centinaio
+        # di MB per sha. Dopo N rilasci il pull fallisce per disco pieno, e con
+        # il root fs pieno non e' solo questo servizio a soffrire.
+        #
+        # `if: always()`: la potatura serve soprattutto DOPO un deploy fallito,
+        # che ha comunque scaricato l'immagine.
+        if: always()
+        run: |
+          set -euo pipefail
+          # Trenta giorni: tiene a portata gli sha recenti per un rollback
+          # immediato, che e' la ragione per cui i tag per sha esistono.
+          docker image prune -af --filter 'until=720h'
+          df -h / | tail -1

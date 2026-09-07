@@ -40,6 +40,17 @@ jobs:
       - name: Build
         run: npx tsc
 
+      - name: L immagine si costruisce
+        # Il Dockerfile e' l'unico pezzo del kit che i test non toccano, e il job
+        # che lo costruisce gira solo sui push a master: una dipendenza nuova che
+        # non compila senza toolchain, o un file che serve a runtime e non e' fra
+        # i `COPY`, passerebbe la review verde e si scoprirebbe con il deploy che
+        # non trova l'immagine. Qui si costruisce e non si pubblica.
+        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.15.0
+        with:
+          context: .
+          push: false
+
       - name: Il compose regge il contratto della flotta
         # Due invarianti che, se rotte, si scoprirebbero sul box a metà di un
         # deploy: che il compose sia sintatticamente valido, e che non pubblichi

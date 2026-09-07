@@ -16,7 +16,18 @@ services:
   mcp-linkedin:
     image: ${MCP_LINKEDIN_IMAGE:?serve MCP_LINKEDIN_IMAGE (ghcr.io/<owner>/mcp-linkedin:<sha>)}
     restart: unless-stopped
-    env_file: .env.mcp-linkedin
+    # `format: raw` disattiva l'interpolazione dentro i VALORI del file di env, e
+    # non e' un dettaglio: senza, Compose tratta i valori come template. Misurato
+    # su Compose v2.37.1 con un container vero: un segreto `Wpl$AP1.abc` arriva
+    # come `Wpl.abc`, e un valore che contenga `${HOME}` arriva con la home del
+    # runner dentro. Il client secret di LinkedIn lo genera LinkedIn e puo'
+    # contenere qualunque carattere, quindi il guasto e' un'autenticazione che
+    # fallisce senza spiegare niente — con il file su disco perfettamente giusto.
+    # Richiede Compose >= 2.30; una versione piu' vecchia rifiuta la chiave, che
+    # e' il modo giusto di scoprirlo.
+    env_file:
+      - path: .env.mcp-linkedin
+        format: raw
     environment:
       # Queste due NON stanno nel file di env, e non è una dimenticanza: sono
       # cablaggio, non configurazione. Il path deve combaciare con il volume qui
@@ -49,10 +60,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      # Il primo avvio apre il database e monta lo schema. Senza questo, un
-      # container sano risulta `unhealthy` per i primi trenta secondi e un
-      # cancello di deploy che guarda lo stato lo boccia.
-      start_period: 10s
 
 networks:
   fleet:
