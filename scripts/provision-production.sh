@@ -35,9 +35,11 @@ gh auth status >/dev/null 2>&1 || fatale "gh non è autenticato: gh auth login"
 say "l'Environment production su ${LINKEDIN_REPO}"
 # `gh secret set --env` non crea l'Environment: su uno che non esiste risponde
 # 404 e non si capisce che manca il contenitore, non il segreto.
-gh api -X PUT "repos/${LINKEDIN_REPO}/environments/${ENVIRONMENT}" \
-  -f 'deployment_branch_policy[protected_branches]=false' \
-  -f 'deployment_branch_policy[custom_branch_policies]=true' >/dev/null
+# Corpo JSON e non `-f`: quei due campi sono booleani, e `-f` manda stringhe —
+# l'API risponde 422 dicendo che `"false"` non è un boolean.
+gh api -X PUT "repos/${LINKEDIN_REPO}/environments/${ENVIRONMENT}" --input - >/dev/null <<'JSON'
+{"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+JSON
 echo "  creato (o già c'era)"
 
 # Il presidio che rende vere le righe di sicurezza in deploy.yml: un Environment
