@@ -1,0 +1,22 @@
+# Cosa NON entra nel contesto di build.
+#
+# `node_modules` è la voce che conta: contiene il `better-sqlite3` compilato per
+# la macchina di chi sviluppa. Copiato in un'immagine linux darebbe un
+# `invalid ELF header` a runtime — e su un Mac non lo scopri prima del deploy.
+# Il resto è peso (il contesto viaggia intero verso il daemon) e superficie: un
+# `.env` locale non deve poter finire in un layer pubblicato su GHCR.
+node_modules
+dist
+.git
+.github
+coverage
+deploy
+docs
+tests
+.env
+.env.*
+*.db
+*.db-journal
+*.db-wal
+.linkedin-mcp/
+.DS_Store

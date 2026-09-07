@@ -13,6 +13,11 @@ dist/
 .env
 .env.local
 .env.*.local
+# Il .env di un giro a mano del deploy: porta il secret di introspection,
+# il client secret LinkedIn e la chiave dei token dei QMate. Il template si
+# copia proprio in questo nome, quindi senza questa riga sarebbe a un
+# `git add .` di distanza dal repo.
+deploy/.env.*
 
 # IDE
 .idea/

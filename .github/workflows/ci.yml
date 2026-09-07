@@ -1,0 +1,106 @@
+# ci.yml — cancello di qualità e pubblicazione dell'artefatto.
+#
+# Gira sui runner GitHub (non sul box): qui non c'è nessun segreto di
+# produzione. Pubblica su GHCR l'immagine `:<sha>` che il deploy metterà in
+# opera — il deploy NON ribuilda mai, così ciò che gira in produzione è
+# esattamente ciò che i test hanno validato.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          # Lo stesso major dell'immagine (`node:22-bookworm-slim`): un runtime
+          # diverso fra i test e la produzione rende i test una misura di
+          # qualcos'altro.
+          node-version: "22"
+          cache: npm
+      - name: Installa
+        # `npm ci` e non `npm install`: la lockfile è il contratto, qui come nel
+        # Dockerfile.
+        run: npm ci
+      - name: Tipi
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Suite
+        run: npm test
+      - name: Build
+        run: npx tsc
+
+      - name: Il compose regge il contratto della flotta
+        # Due invarianti che, se rotte, si scoprirebbero sul box a metà di un
+        # deploy: che il compose sia sintatticamente valido, e che non pubblichi
+        # porte. Un `ports:` esporrebbe il servizio direttamente sul box
+        # scavalcando l'edge — quindi senza TLS, senza HSTS e senza i timeout di
+        # Streamable HTTP.
+        #
+        # Il controllo è scritto perché l'ASSENZA sia il successo. `grep -c` in
+        # forma `== 0` stampa 0 ma ESCE 1 quando non trova nulla: sarebbe rosso
+        # esattamente sull'albero corretto, e un cancello rosso a torto viene
+        # cancellato dal primo che ci sbatte.
+        run: |
+          set -euo pipefail
+          compose=deploy/docker-compose.yml
+          # Su un file inesistente grep esce 2 e la condizione è falsa, cioè il
+          # controllo passerebbe: si supererebbe cancellando il file da
+          # controllare.
+          test -f "${compose}"
+          if grep -qE '^[[:space:]]*ports:' "${compose}"; then
+            echo "::error file=${compose}::pubblica porte: un servizio della flotta parla solo dentro la rete fleet, è l'edge a esporlo"
+            exit 1
+          fi
+          # `config` pretende che l'env_file esista, e in produzione lo scrive
+          # deploy.yml dai segreti. Il template fa da controfigura — e così
+          # questo controllo verifica anche che sia un file di env leggibile,
+          # non solo che il compose sia valido.
+          cp deploy/env.mcp-linkedin.example deploy/.env.mcp-linkedin
+          MCP_LINKEDIN_IMAGE=ghcr.io/example/mcp-linkedin:ci \
+            docker compose -f "${compose}" config -q
+          rm deploy/.env.mcp-linkedin
+
+  image:
+    needs: quality
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Owner in minuscolo
+        # GHCR rifiuta i nomi con maiuscole, e `github.repository_owner` le
+        # conserva.
+        run: echo "OWNER_LC=$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+      - name: Build e push di mcp-linkedin
+        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.15.0
+        with:
+          context: .
+          push: true
+          # L'immagine prende il nome del SERVIZIO nella flotta, non del repo:
+          # è `mcp-linkedin` che si legge nel compose, nel frammento Caddy e in
+          # `docker ps`, e un secondo nome per la stessa cosa è un nome in cui
+          # sbagliarsi.
+          #
+          # Solo il tag :<sha>, nessun `latest`: un tag mobile verrebbe
+          # ri-pubblicato al push successivo, e un rollback che puntasse a
+          # `latest` ri-scaricherebbe la stessa immagine rotta.
+          tags: ghcr.io/${{ env.OWNER_LC }}/mcp-linkedin:${{ github.sha }}

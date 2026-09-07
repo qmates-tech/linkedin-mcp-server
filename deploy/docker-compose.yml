@@ -1,0 +1,59 @@
+# mcp-linkedin: il resource server LinkedIn della flotta.
+#
+# Nessun `build:`, di proposito: ciò che gira qui è esattamente l'artefatto che
+# la CI ha validato, identificato dallo sha di commit. Un `build` in questo file
+# reintrodurrebbe la possibilità che il codice testato e quello in esecuzione
+# divergano — e siccome questo è l'unico compose del servizio, non esiste una
+# variante "di sviluppo" che possa scivolare in produzione. In locale si lavora
+# con `npm run dev`.
+#
+# Lo lancia deploy.yml dalla custodia ~/.mcp-linkedin-deploy, con
+# MCP_LINKEDIN_IMAGE risolta allo sha.
+services:
+  # Il nome del servizio È l'indirizzo: Compose lo registra come alias sulla
+  # rete `fleet`, ed è il nome che `deploy/caddy/mcp-linkedin.caddy` mette dopo
+  # `reverse_proxy`. Rinominarlo qui significa un 502 sull'edge.
+  mcp-linkedin:
+    image: ${MCP_LINKEDIN_IMAGE:?serve MCP_LINKEDIN_IMAGE (ghcr.io/<owner>/mcp-linkedin:<sha>)}
+    restart: unless-stopped
+    env_file: .env.mcp-linkedin
+    environment:
+      # Queste due NON stanno nel file di env, e non è una dimenticanza: sono
+      # cablaggio, non configurazione. Il path deve combaciare con il volume qui
+      # sotto e la porta con il frammento Caddy e con la healthcheck — tenerli
+      # nella stessa schermata di ciò che devono combaciare è l'unico modo di
+      # accorgersene. (`environment:` vince su `env_file:`, quindi una copia nel
+      # file di env non avrebbe effetto e ingannerebbe chi la legge.)
+      QLI_DB_PATH: /data/linkedin.db
+      QLI_PORT: "8080"
+    volumes:
+      # Il proprio LV sul volume dati: qui vivono i token LinkedIn di ogni
+      # QMate, cifrati con QLI_TOKEN_KEY. Su una directory qualunque di `/`
+      # crescerebbero senza tetto insieme al disco di tutta la flotta — e
+      # sparirebbero al primo box ricostruito, senza un errore da nessuna parte.
+      # La directory deve appartenere a uid 1000 (l'utente `node` del
+      # container): vedi i prerequisiti in README.md.
+      - /srv/fleet/mcp-linkedin:/data
+    networks:
+      - fleet
+    healthcheck:
+      # 127.0.0.1 e NON localhost: nel container `localhost` risolve prima a
+      # ::1, e un processo in ascolto solo su IPv4 risponde connection refused.
+      # L'edge della flotta è stato marcato `unhealthy` per undici ore per
+      # questo, mentre serviva ogni richiesta.
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Il primo avvio apre il database e monta lo schema. Senza questo, un
+      # container sano risulta `unhealthy` per i primi trenta secondi e un
+      # cancello di deploy che guarda lo stato lo boccia.
+      start_period: 10s
+
+networks:
+  fleet:
+    external: true

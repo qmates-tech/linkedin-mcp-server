@@ -1,0 +1,22 @@
+# mcp-linkedin.caddy — depositato dal deploy di questo repo.
+#
+# Si copia in /srv/fleet/edge/services/ del box; gli snippet importati li
+# definisce il Caddyfile dell'edge (repo qmates-mcp-fleet, infra/edge/).
+#
+# Il nome del file è la RIVENDICAZIONE dell'hostname: `fleet-publish-fragments`
+# attraversa tutte le custodie di deploy e, se due portano lo stesso
+# `<host>.caddy`, non pubblica nulla. Finché il probe della milestone §14 vive
+# in qmates-auth-server/deploy/caddy/mcp-linkedin.caddy, il primo deploy di
+# questo servizio si ferma lì — vedi i prerequisiti in ../README.md.
+mcp-linkedin.qmates.tech {
+	import fleet-tls
+	# `small-bodies` NON si importa qui, benché `POST /mcp` sia raggiungibile da
+	# un anonimo: il suo tetto da 64KB troncherebbe le tool-call che portano
+	# un'immagine in base64, che è il prezzo di non accettare percorsi locali
+	# (standard §4). Il corpo lo limita il servizio, a 12MB e solo DOPO aver
+	# validato il bearer (vedi LARGEST_MCP_BODY in src/service.ts): una
+	# richiesta anonima non viene mai bufferizzata.
+	reverse_proxy mcp-linkedin:8080 {
+		import mcp-upstream
+	}
+}

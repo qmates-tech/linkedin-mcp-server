@@ -1,0 +1,317 @@
+# deploy.yml — messa in opera di mcp-linkedin sul box della flotta.
+#
+# I SEGRETI NON PASSANO DA NESSUNO. Il client secret dell'app LinkedIn e la
+# chiave con cui i token dei QMate stanno cifrati vivono solo nell'Environment
+# `production` di questo repo: GitHub li consegna al runner, il runner li scrive
+# in un `.env` 0600 sul box, e nessun essere umano — né assistente — li digita,
+# li incolla o li rilegge.
+#
+# Sicurezza:
+#   * SOLO workflow_dispatch: la messa in opera è un atto umano esplicito, e non
+#     c'è race fra CI che pubblica e deploy che scarica.
+#   * environment: production — confina i segreti ai job che vi girano.
+#   * permessi minimi: contents:read + packages:read. Non pubblica nulla.
+#   * i segreti arrivano agli step via `env:`, MAI interpolati nel corpo di un
+#     `run:`: un `${{ secrets.X }}` dentro lo script finisce nel comando, e
+#     quindi nella process list del box e in ogni `set -x`.
+#   * non ribuilda: mette in opera l'immagine `:<sha>` che la CI ha validato.
+#
+# UN PRESIDIO VIVE FUORI DA QUESTO FILE, e senza di esso le righe sopra sono
+# false:
+#   Environment `production` → Deployment branches and tags = SOLO `master`.
+#   Un Environment nasce con «All branches»: senza la restrizione, chiunque possa
+#   pushare spinge un branch con questo file modificato, lo lancia dal menu
+#   Actions scegliendo quel ref, e GitHub gli consegna la chiave di cifratura dei
+#   token LinkedIn di tutti i QMate — su un runner che ha privilegi equivalenti a
+#   root sul box.
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: >-
+          SHA di commit a 40 esadecimali per cui la CI ha già pubblicato
+          l'immagine. Vuoto = il commit di questo run. Tag mobili rifiutati.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: deploy-mcp-linkedin-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy-production
+    environment: production
+    # L'etichetta `fleet` pinna IL BOX: `self-hosted` nuda non è un indirizzo, e
+    # con più runner nell'organizzazione un dispatch atterrerebbe altrove — dove
+    # nulla di questo stato esiste.
+    runs-on: [self-hosted, fleet]
+    timeout-minutes: 20
+    env:
+      DATA_DIR: /srv/fleet/mcp-linkedin
+      FRAGMENT: mcp-linkedin.caddy
+      SERVICE_HOST: mcp-linkedin.qmates.tech
+      # Il nome della custodia: `fleet-publish-fragments` attraversa
+      # `/opt/gha-runner/.*-deploy/caddy`, quindi questo nome è ciò che rende il
+      # frammento pubblicabile. Lo step "Apparecchia la custodia" verifica che
+      # la home del runner sia davvero quella: altrimenti il frammento non
+      # verrebbe pubblicato MAI e l'hostname risponderebbe 404 con il container
+      # perfettamente sano.
+      CUSTODIA: .mcp-linkedin-deploy
+    steps:
+      - name: Valida il tag e risolvi il commit
+        env:
+          IMAGE_TAG_INPUT: ${{ github.event.inputs.image_tag }}
+          GITHUB_SHA_INPUT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          tag="${IMAGE_TAG_INPUT:-}"
+          [ -n "${tag}" ] || tag="${GITHUB_SHA_INPUT}"
+          case "${tag}" in
+            *[!0-9a-f]*)
+              echo "::error::serve uno sha di commit (40 esadecimali minuscoli), non un tag mobile"
+              exit 1;;
+          esac
+          if [ "${#tag}" -ne 40 ]; then
+            echo "::error::tag non valido (${#tag} caratteri)"
+            exit 1
+          fi
+          echo "DEPLOY_REF=${tag}" >> "$GITHUB_ENV"
+
+      - name: Il posto dei dati c'è, ed è nostro
+        # Il prezzo di `nofail` in fstab: senza questo controllo il servizio
+        # ripartirebbe su una directory vuota e si ricreerebbe un database senza
+        # collegamenti, e ogni QMate si ritroverebbe da ricollegare senza che
+        # nessuno sappia perché.
+        run: |
+          set -euo pipefail
+          # Il guard della flotta copre anche questo mount (l'elenco sta in
+          # infra/provision/bootstrap.sh, funzione fleet-mounts-ok); il controllo
+          # qui sotto resta perché il guard puo' essere piu' vecchio del box.
+          /usr/local/bin/fleet-mounts-ok
+          if ! mountpoint -q "${DATA_DIR}"; then
+            echo "::error::${DATA_DIR} non è un mount: rilancia infra/provision/bootstrap.sh dal repo qmates-mcp-fleet (è idempotente, e crea l'LV del servizio)."
+            exit 1
+          fi
+          # uid 1000 è l'utente `node` con cui gira il container (USER node nel
+          # Dockerfile). Se la directory resta di root, SQLite non apre il
+          # database e il servizio muore al primo collegamento LinkedIn — con un
+          # errore che parla di file, non di permessi. La assegna bootstrap.sh
+          # (`own_data mcp-linkedin 1000`), DOPO il mount: assegnarla prima
+          # toccherebbe la directory che il mount nasconde.
+          owner="$(stat -c '%u' "${DATA_DIR}")"
+          if [ "${owner}" != "1000" ]; then
+            echo "::error::${DATA_DIR} appartiene a uid ${owner}, non a 1000: rilancia infra/provision/bootstrap.sh, oppure da root sul box 'install -d -o 1000 -g 1000 -m 700 ${DATA_DIR}'"
+            exit 1
+          fi
+
+      - name: Nessun altro reclama l'hostname
+        # `fleet-publish-fragments` attraversa TUTTE le custodie di deploy e, se
+        # due portano lo stesso `<host>.caddy`, rifiuta e non pubblica nulla.
+        # Scoprirlo qui invece di allo step di pubblicazione evita di lasciare in
+        # piedi un container che nessuno raggiunge.
+        #
+        # L'assenza è il successo: se nessun altro file esiste, il ciclo non
+        # entra nemmeno una volta.
+        run: |
+          set -euo pipefail
+          disputers=""
+          for frag in /opt/gha-runner/.*-deploy/caddy/"${FRAGMENT}"; do
+            [ -f "${frag}" ] || continue
+            case "${frag}" in
+              */"${CUSTODIA}"/*) continue;;
+            esac
+            disputers="${disputers} ${frag}"
+          done
+          if [ -n "${disputers}" ]; then
+            echo "::error::${SERVICE_HOST} è reclamato anche da:${disputers} — finché quel frammento esiste il pubblicatore rifiuta e non pubblica nulla. Smonta il probe della milestone §14 e cancella il suo file nello stesso commit."
+            exit 1
+          fi
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.DEPLOY_REF }}
+
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Risolvi l'immagine
+        run: |
+          set -euo pipefail
+          owner_lc="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "MCP_LINKEDIN_IMAGE=ghcr.io/${owner_lc}/mcp-linkedin:${DEPLOY_REF}" >> "$GITHUB_ENV"
+
+      - name: Apparecchia la custodia
+        run: |
+          set -euo pipefail
+          stack="${HOME}/${CUSTODIA}"
+          # Il glob del pubblicatore è cablato su /opt/gha-runner: una custodia
+          # fuori da lì non verrebbe mai attraversata, e il deploy risulterebbe
+          # verde con l'hostname che risponde 404.
+          case "${stack}" in
+            /opt/gha-runner/.*-deploy) ;;
+            *)
+              echo "::error::la custodia è ${stack}, fuori dal glob /opt/gha-runner/.*-deploy che fleet-publish-fragments attraversa: il frammento non verrebbe pubblicato"
+              exit 1;;
+          esac
+          install -d -m 700 "${stack}"
+          install -m 644 deploy/docker-compose.yml "${stack}/docker-compose.yml"
+          install -d -m 755 "${stack}/caddy"
+          install -m 644 "deploy/caddy/${FRAGMENT}" "${stack}/caddy/${FRAGMENT}"
+          echo "STACK=${stack}" >> "$GITHUB_ENV"
+
+      - name: Materializza il .env nella custodia
+        # I valori arrivano SOLO da qui. Nessun echo, nessun set -x: `set +x` è
+        # esplicito perché un domani qualcuno potrebbe attivare il debug del
+        # runner, e questo step stamperebbe la chiave di cifratura nel log.
+        #
+        # QLI_DB_PATH e QLI_PORT non compaiono: le pinna il compose, accanto al
+        # volume e alla healthcheck con cui devono combaciare.
+        env:
+          # Lo stesso segreto che lato AS sta in QAS_RS_CLIENTS per l'id
+          # `mcp-linkedin`, depositato là come QAS_RS_SECRET_MCP_LINKEDIN.
+          QLI_INTROSPECT_SECRET: ${{ secrets.QLI_INTROSPECT_SECRET }}
+          QLI_LINKEDIN_CLIENT_ID: ${{ secrets.QLI_LINKEDIN_CLIENT_ID }}
+          QLI_LINKEDIN_CLIENT_SECRET: ${{ secrets.QLI_LINKEDIN_CLIENT_SECRET }}
+          QLI_TOKEN_KEY: ${{ secrets.QLI_TOKEN_KEY }}
+          QLI_RESOURCE_URL: ${{ vars.QLI_RESOURCE_URL }}
+          QLI_AS_URL: ${{ vars.QLI_AS_URL }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          {
+            printf 'QLI_RESOURCE_URL=%s\n' "${QLI_RESOURCE_URL}"
+            printf 'QLI_AS_URL=%s\n' "${QLI_AS_URL}"
+            # L'id è cablato, non una variabile: è lo stesso nome del servizio,
+            # del container e dell'immagine, e deve comparire in
+            # QAS_RS_CLIENT_IDS lato AS. Una variabile in più sarebbe solo un
+            # posto in più in cui divergere.
+            printf 'QLI_INTROSPECT_CLIENT_ID=%s\n' "mcp-linkedin"
+            printf 'QLI_INTROSPECT_SECRET=%s\n' "${QLI_INTROSPECT_SECRET}"
+            printf 'QLI_LINKEDIN_CLIENT_ID=%s\n' "${QLI_LINKEDIN_CLIENT_ID}"
+            printf 'QLI_LINKEDIN_CLIENT_SECRET=%s\n' "${QLI_LINKEDIN_CLIENT_SECRET}"
+            printf 'QLI_TOKEN_KEY=%s\n' "${QLI_TOKEN_KEY}"
+          } > "${STACK}/.env.mcp-linkedin"
+          chmod 600 "${STACK}/.env.mcp-linkedin"
+          # Verifica di PRESENZA, non di valore: un secret dimenticato
+          # nell'Environment darebbe altrimenti un container in crash-loop e un
+          # deploy che scade su /healthz senza dire cosa manca.
+          if grep -qE '^[A-Z_]+=$' "${STACK}/.env.mcp-linkedin"; then
+            echo "::error::nel .env c'è una variabile vuota: manca un secret o una var nell'Environment production"
+            exit 1
+          fi
+          # Sette variabili, sette righe. Un secret depositato con `echo` invece
+          # che con `printf` porta un newline dentro il valore: il file ne
+          # avrebbe otto, il valore arriverebbe troncato al container e
+          # l'introspection risponderebbe 401 senza spiegare niente.
+          righe="$(wc -l < "${STACK}/.env.mcp-linkedin")"
+          if [ "${righe}" -ne 7 ]; then
+            echo "::error::il .env ha ${righe} righe invece di 7: un secret dell'Environment contiene un newline. Ridepositalo con printf, non con echo."
+            exit 1
+          fi
+          echo ".env scritto, 0600, sette campi pieni"
+
+      - name: Su
+        run: |
+          set -euo pipefail
+          cd "${STACK}"
+          # Se l'immagine non esiste, il pull dice solo "not found": la causa
+          # vera è che la CI non ha (ancora) pubblicato quello sha, e vale la
+          # pena dirlo invece di far leggere un errore del registry.
+          if ! docker compose -f docker-compose.yml pull -q; then
+            echo "::error::immagine assente su GHCR per ${DEPLOY_REF}. La CI ha pubblicato quel commit? Il job image gira solo sui push a master, non sulle pull request."
+            exit 1
+          fi
+          docker compose -f docker-compose.yml up -d --remove-orphans
+
+      - name: Il servizio risponde?
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if docker compose -f "${STACK}/docker-compose.yml" exec -T mcp-linkedin \
+                 node -e "fetch('http://127.0.0.1:8080/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))" 2>/dev/null; then
+              echo "healthz OK dopo ${i} tentativi"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::mcp-linkedin non risponde su /healthz. Se nei log qui sotto c'è 'configurazione inutilizzabile', manca una variabile: il messaggio la nomina."
+          docker compose -f "${STACK}/docker-compose.yml" logs --tail 40 mcp-linkedin
+          exit 1
+
+      - name: Pubblica sull'edge e ricarica
+        run: |
+          set -euo pipefail
+          # Comando fisso: la regola sudo del runner concede questo e solo questo.
+          if ! sudo /usr/local/bin/fleet-publish-fragments; then
+            echo "::error::il pubblicatore ha rifiutato. Se nomina due custodie per ${FRAGMENT}, un altro repo reclama ancora ${SERVICE_HOST}: cancella il suo frammento."
+            exit 1
+          fi
+          # Il container si cerca per etichetta, non per nome: `edge-caddy-1` lo
+          # compone Compose dal nome della cartella da cui l'edge e' stato
+          # avviato, quindi un `-p` o una custodia diversa lo cambierebbero — e
+          # il deploy risulterebbe verde con l'edge che serve ancora la vecchia
+          # configurazione, cioe' 404 sul nostro hostname.
+          edge="$(docker ps --filter 'label=com.docker.compose.service=caddy' --format '{{.Names}}' | head -1)"
+          if [ -z "${edge}" ]; then
+            echo "::error::non trovo il container dell'edge (label com.docker.compose.service=caddy). Il frammento e' pubblicato ma l'edge non lo ha caricato: ricarica a mano."
+            exit 1
+          fi
+          # Caddy valida prima di applicare: un frammento rotto fa fallire il
+          # reload e lascia in piedi la configurazione precedente.
+          docker exec "${edge}" caddy reload --config /etc/caddy/Caddyfile
+          echo "edge ${edge} ricaricato"
+
+      - name: Verifica pubblica
+        # Le prime tre voci della checklist §8 dello standard, dall'esterno e
+        # attraverso l'edge: è il solo punto di vista che coincide con quello di
+        # un client MCP.
+        env:
+          QLI_RESOURCE_URL: ${{ vars.QLI_RESOURCE_URL }}
+        run: |
+          set -euo pipefail
+
+          health="$(curl -sS --max-time 15 "https://${SERVICE_HOST}/healthz")"
+          case "${health}" in
+            *'"status":"ok"'*) ;;
+            *) echo "::error::/healthz attraverso l'edge ha risposto: ${health}"; exit 1;;
+          esac
+
+          metadata="$(curl -sS --max-time 15 "https://${SERVICE_HOST}/.well-known/oauth-protected-resource")"
+          # La `resource` pubblicata è il valore che il client rimanda all'AS:
+          # se non combacia con la voce di QAS_AUDIENCES, il login riesce e ogni
+          # chiamata MCP torna 401 — il guasto più noioso da diagnosticare della
+          # flotta, e quello che si paga a login già fatto.
+          case "${metadata}" in
+            *"\"resource\":\"${QLI_RESOURCE_URL}\""*) ;;
+            *) echo "::error::la metadata RFC 9728 non dichiara ${QLI_RESOURCE_URL}. Ha risposto: ${metadata}"; exit 1;;
+          esac
+
+          anonima="$(curl -sS -i -X POST --max-time 15 "https://${SERVICE_HOST}/mcp" \
+                     -H 'content-type: application/json' \
+                     -d '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{}}')"
+          # La riga di stato, non il corpo: un 200 con "401" scritto dentro
+          # passerebbe un controllo che cerca la cifra dappertutto.
+          case "$(printf '%s\n' "${anonima}" | head -1)" in
+            *' 401'*) ;;
+            *) echo "::error::POST /mcp senza token non ha risposto 401"; printf '%s\n' "${anonima}" | head -5; exit 1;;
+          esac
+          # Senza l'header che cita la metadata, un client non sa da dove
+          # cominciare: non è un dettaglio di conformità, è la differenza fra un
+          # login e un errore opaco.
+          if ! printf '%s\n' "${anonima}" | grep -qi 'www-authenticate:.*oauth-protected-resource'; then
+            echo "::error::il 401 non cita resource_metadata nel WWW-Authenticate"
+            printf '%s\n' "${anonima}" | head -10
+            exit 1
+          fi
+          echo "metadata, 401 e header di scoperta a posto"
