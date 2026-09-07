@@ -1,102 +1,47 @@
-/**
- * LinkedIn MCP Server - Core server setup.
- * Wires together auth, API client, capability detection, and tool modules.
- */
-
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { OAuth2Manager } from './auth/oauth2.js';
-import { TokenStore } from './auth/token-store.js';
-import { registerAuthTools } from './auth/tools.js';
-import { LinkedInApiClient } from './client/api-client.js';
-import { CapabilityDetector } from './capabilities/detector.js';
-import { registerProfileTools } from './modules/profile/tools.js';
-import { registerPostingTools } from './modules/posting/tools.js';
-import { registerEventTools } from './modules/events/tools.js';
-import { PostHistory } from './client/post-history.js';
-import type { ServerConfig } from './types/index.js';
 
-export interface ServerDependencies {
-  config: ServerConfig;
-  tokenStore?: TokenStore;
+import { LinkedInApi } from './client/api-client.js';
+import type { QMateSubject } from './fleet/acting-qmate.js';
+import type { LinkedInLinks } from './linkedin/link.js';
+import type { Linking } from './linkedin/linking.js';
+import type { PublishedPostsStore } from './linkedin/published-posts.js';
+import { registerEventTools } from './tools/events.js';
+import { registerLinkTools } from './tools/link.js';
+import { registerPostingTools } from './tools/posting.js';
+import { registerProfileTools } from './tools/profile.js';
+
+const NAME = 'mcp-linkedin';
+const VERSION = '1.0.0';
+
+export interface LinkedInService {
+  links: LinkedInLinks;
+  linking: Linking;
+  publishedPosts: PublishedPostsStore;
+  linkedIn?: LinkedInApi;
 }
 
-export function createLinkedInMcpServer(deps: ServerDependencies) {
-  const { config } = deps;
+/**
+ * Un `McpServer` per richiesta, col QMate legato alla costruzione.
+ *
+ * Tutti i quindici tool sono registrati sempre. Il fork calcolava quali abilitare
+ * dagli scope concessi e poi buttava il risultato; farlo davvero, qui, sarebbe
+ * peggio: la lista dei tool cambierebbe sotto i piedi di un client che l'ha
+ * chiesta al collegamento, e un tool che manca è più difficile da capire di un
+ * tool che dice «non hai collegato LinkedIn, usa linkedin_link_start».
+ */
+export function mcpServerFor(service: LinkedInService): (qmate: QMateSubject) => McpServer {
+  const linkedInApi = service.linkedIn ?? new LinkedInApi();
 
-  // Initialize persistence
-  const tokenStore = deps.tokenStore ?? new TokenStore(config.storage.dbPath);
+  return (qmate: QMateSubject): McpServer => {
+    const server = new McpServer({ name: NAME, version: VERSION });
+    const link = service.links.of(qmate);
+    const asMember = linkedInApi.as(link);
 
-  // Initialize auth
-  const authManager = new OAuth2Manager(config.linkedin, tokenStore);
+    registerLinkTools(server, qmate, link, service.linking);
+    registerProfileTools(server, asMember);
+    registerPostingTools(server, asMember, link, service.publishedPosts.of(qmate));
+    registerEventTools(server, asMember, link);
 
-  // Initialize capability detection
-  const capabilityDetector = new CapabilityDetector();
-
-  // Initialize post history tracker
-  const postHistory = new PostHistory(tokenStore.getDatabase());
-
-  // Auto-restore session from stored token (survives server restarts)
-  let currentUserId: string | null = tokenStore.findActiveUser();
-
-  const findExistingUser = (): string | null => {
-    return currentUserId;
-  };
-
-  // Initialize API client
-  const apiClient = new LinkedInApiClient({
-    baseUrl: config.linkedin.apiBaseUrl,
-    getAccessToken: async () => {
-      const userId = findExistingUser();
-      if (!userId) {
-        throw new Error('Not authenticated. Use linkedin_auth_start first.');
-      }
-      return authManager.getAccessToken(userId);
-    },
-  });
-
-  // Helper to get user ID for tools
-  const getUserId = async (): Promise<string> => {
-    const userId = findExistingUser();
-    if (!userId) {
-      throw new Error('Not authenticated. Use linkedin_auth_start first.');
-    }
-    return userId;
-  };
-
-  // Create MCP server
-  const server = new McpServer({
-    name: config.server.name,
-    version: config.server.version,
-  });
-
-  // Always register auth tools
-  registerAuthTools(server, authManager, capabilityDetector, () => currentUserId, (userId: string) => {
-    currentUserId = userId;
-  });
-
-  // Detect capabilities and register appropriate modules
-  const grantedScopes = currentUserId ? authManager.getGrantedScopes(currentUserId) : [];
-  const modules = capabilityDetector.detect(grantedScopes);
-
-  // For self-serve mode, register all self-serve tools
-  // They will return auth errors if not authenticated yet
-  // This is better UX than hiding tools - user can see what's available
-  registerProfileTools(server, apiClient);
-  registerPostingTools(server, apiClient, getUserId, postHistory);
-  registerEventTools(server, apiClient, getUserId);
-
-  // Return server and a way to update the user ID after auth
-  return {
-    server,
-    setCurrentUserId: (userId: string) => {
-      currentUserId = userId;
-    },
-    getCapabilities: () => {
-      const scopes = currentUserId ? authManager.getGrantedScopes(currentUserId) : [];
-      return capabilityDetector.detect(scopes);
-    },
-    close: () => {
-      tokenStore.close();
-    },
+    return server;
   };
 }

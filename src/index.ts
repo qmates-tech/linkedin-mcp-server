@@ -1,80 +1,86 @@
 #!/usr/bin/env node
 
 /**
- * LinkedIn MCP Server - Entry point.
- * Starts the server with stdio transport for local CLI use.
+ * `mcp-linkedin`: il resource server LinkedIn della flotta QMates.
+ *
+ * Un normale processo HTTP che parla MCP Streamable HTTP su `/mcp` e non
+ * pubblica porte: sta sulla rete `fleet` e lo espone l'edge. Chi sei lo dice
+ * `auth.qmates.tech`; cosa colleghi resta qui.
  */
 
-import 'dotenv/config';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
-import { mkdirSync, chmodSync } from 'node:fs';
-import { createLinkedInMcpServer } from './server.js';
-import type { ServerConfig } from './types/index.js';
-import { SELF_SERVE_SCOPES } from './types/index.js';
+import { IntrospectionVerifier } from './fleet/introspection.js';
+import { loadConfiguration, UnusableConfiguration } from './fleet/configuration.js';
+import { LinkedInLinks } from './linkedin/link.js';
+import { LinkStore } from './linkedin/link-store.js';
+import { Linking } from './linkedin/linking.js';
+import { PublishedPostsStore } from './linkedin/published-posts.js';
+import { mcpServerFor } from './server.js';
+import { buildService } from './service.js';
 
-function getConfig(): ServerConfig {
-  const clientId = process.env.LINKEDIN_CLIENT_ID;
-  const clientSecret = process.env.LINKEDIN_CLIENT_SECRET;
+/**
+ * `EX_CONFIG` di sysexits: distingue «mal configurato» da «crashato», e serve
+ * al deploy per non riprovare ciò che non può riuscire.
+ *
+ * Va usato con `process.exit` esplicito: `process.exitCode` seguito da un
+ * throw esce con 1, perché il percorso di eccezione fatale di Node lo ignora.
+ */
+const MISCONFIGURED = 78;
 
-  if (!clientId || !clientSecret) {
-    console.error(
-      'Error: LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET environment variables are required.',
-    );
-    console.error('');
-    console.error('Set them in your MCP client configuration:');
-    console.error('  LINKEDIN_CLIENT_ID=your_client_id');
-    console.error('  LINKEDIN_CLIENT_SECRET=your_client_secret');
-    process.exit(1);
+function main(): void {
+  let configuration;
+  try {
+    configuration = loadConfiguration();
+  } catch (unusable) {
+    if (unusable instanceof UnusableConfiguration) {
+      process.stderr.write(`${unusable.message}\n`);
+      process.exit(MISCONFIGURED);
+    }
+    throw unusable;
   }
 
-  // Ensure data directory exists.
-  // 0700: the token DB lives here in cleartext; keep it untraversable by other
-  // local accounts (also covers SQLite's world-readable -wal/-shm sidecars).
-  // chmod as well, to harden a dir an older version created at 0755.
-  const dataDir = process.env.LINKEDIN_MCP_DATA_DIR ?? join(homedir(), '.linkedin-mcp');
-  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-  chmodSync(dataDir, 0o700);
+  const store = new LinkStore(configuration.databasePath, configuration.tokenKey);
+  const linking = new Linking({
+    store,
+    clientId: configuration.linkedIn.clientId,
+    clientSecret: configuration.linkedIn.clientSecret,
+    redirectUri: configuration.linkedIn.redirectUri,
+  });
 
-  return {
-    linkedin: {
-      clientId,
-      clientSecret,
-      redirectUri: process.env.LINKEDIN_REDIRECT_URI ?? 'http://localhost:3000/callback',
-      scopes: SELF_SERVE_SCOPES,
-      apiBaseUrl: process.env.LINKEDIN_API_BASE_URL ?? 'https://api.linkedin.com',
-      authBaseUrl: process.env.LINKEDIN_AUTH_BASE_URL ?? 'https://www.linkedin.com/oauth/v2',
-    },
-    server: {
-      name: 'linkedin-mcp-server',
-      version: '0.1.0',
-      transport: 'stdio',
-    },
-    storage: {
-      dbPath: join(dataDir, 'tokens.db'),
-    },
+  const service = buildService({
+    configuration,
+    linking,
+    verifier: new IntrospectionVerifier({
+      authorizationServer: configuration.authorizationServer,
+      resource: configuration.resource,
+      clientId: configuration.introspection.clientId,
+      clientSecret: configuration.introspection.clientSecret,
+    }),
+    mcpServerFor: mcpServerFor({
+      links: new LinkedInLinks(store, linking),
+      linking,
+      publishedPosts: new PublishedPostsStore(store.database),
+    }),
+  });
+
+  const listening = service.listen(configuration.port, '0.0.0.0', () => {
+    process.stdout.write(
+      `${JSON.stringify({
+        event: 'listening',
+        port: configuration.port,
+        resource: configuration.resource,
+        authorizationServer: configuration.authorizationServer,
+      })}\n`,
+    );
+  });
+
+  const stopServing = (): void => {
+    listening.close(() => {
+      store.close();
+      process.exit(0);
+    });
   };
+  process.on('SIGINT', stopServing);
+  process.on('SIGTERM', stopServing);
 }
 
-async function main() {
-  const config = getConfig();
-  const { server } = createLinkedInMcpServer({ config });
-
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-
-  // Handle graceful shutdown
-  const shutdown = async () => {
-    await server.close();
-    process.exit(0);
-  };
-
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-}
-
-main().catch((error) => {
-  console.error('Fatal error:', error);
-  process.exit(1);
-});
+main();

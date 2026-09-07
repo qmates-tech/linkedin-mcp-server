@@ -12,26 +12,6 @@ export type ShareUrn = `urn:li:share:${string}`;
 export type PostUrn = `urn:li:${string}:${string}`;
 export type ImageUrn = `urn:li:image:${string}`;
 
-// --- OAuth ---
-
-export interface OAuthTokenResponse {
-  access_token: string;
-  expires_in: number;
-  refresh_token?: string;
-  refresh_token_expires_in?: number;
-  scope: string;
-}
-
-export interface StoredToken {
-  userId: string;
-  accessToken: string;
-  refreshToken?: string;
-  scopes: string[];
-  expiresAt: number; // Unix timestamp ms
-  refreshTokenExpiresAt?: number;
-  createdAt: number;
-}
-
 // --- Scopes ---
 
 export const LINKEDIN_SCOPES = {

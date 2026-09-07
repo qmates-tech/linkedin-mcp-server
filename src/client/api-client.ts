@@ -1,171 +1,191 @@
+import { LINKEDIN } from '../fleet/configuration.js';
+import type { LinkedInLink } from '../linkedin/link.js';
+import type { LinkedInApiErrorResponse } from '../types/index.js';
+import { LinkedInApiError, RetryableError } from './errors.js';
+import { linkedInVersionHeaders } from './linkedin-version.js';
+import { RateLimiter, type RateLimitInfo } from './rate-limiter.js';
+
 /**
- * Core LinkedIn API HTTP client.
- * Handles authentication headers, API versioning, retries with exponential backoff,
- * rate limit tracking, and structured error handling.
+ * LinkedIn, parlato come un QMate preciso.
+ *
+ * `LinkedInApi` è condiviso — tiene i contatori delle quote, che devono
+ * sopravvivere alle singole richieste — e `as(link)` ne rende una facciata già
+ * legata a un collegamento. I metodi della facciata non prendono un'identità,
+ * quindi un tool non ha un bearer né un autore da sbagliare: nel fork il token
+ * si risolveva da uno stato di processo, in un punto del codice diverso da
+ * quello che componeva l'urn dell'autore, e le due cose potevano divergere.
  */
 
-import { RateLimiter } from './rate-limiter.js';
-import { ApiVersionManager } from './version-manager.js';
-import { LinkedInApiError, RetryableError } from './errors.js';
-import type { LinkedInApiErrorResponse } from '../types/index.js';
+/**
+ * Dove è lecito spedire il bearer di un QMate fuori dalle rotte API.
+ *
+ * L'URL di upload arriva dentro una risposta di LinkedIn, quindi è un dato
+ * ricevuto: senza questo controllo una risposta manomessa — o un endpoint
+ * sbagliato — farebbe fare una PUT autenticata verso un host scelto da altri,
+ * con l'access token del QMate nell'header. L'elenco è nel codice, non in
+ * configurazione: un confine che la configurazione può allargare è un confine
+ * che si apre per un refuso in una env var.
+ */
+const HOSTS_ALLOWED_TO_RECEIVE_UPLOADS = ['linkedin.com', 'licdn.com'];
 
-export interface RequestConfig {
+export interface RequestShape {
   method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
   path: string;
   body?: unknown;
   headers?: Record<string, string>;
-  versioned?: boolean; // Whether to include LinkedIn-Version header (default: true)
+  /** Gli endpoint non versionati (`/v2/userinfo`) rifiutano l'header di versione. */
+  versioned?: boolean;
 }
 
-export interface ApiClientConfig {
-  baseUrl: string;
+export interface LinkedInApiOptions {
+  baseUrl?: string;
   maxRetries?: number;
-  getAccessToken: () => Promise<string>;
+  fetch?: typeof globalThis.fetch;
 }
 
-export class LinkedInApiClient {
-  private rateLimiter: RateLimiter;
-  private versionManager: ApiVersionManager;
-  private config: ApiClientConfig;
-  private maxRetries: number;
+export class LinkedInApi {
+  private readonly quotas = new RateLimiter();
+  private readonly baseUrl: string;
+  private readonly maxRetries: number;
+  private readonly fetch: typeof globalThis.fetch;
 
-  constructor(config: ApiClientConfig) {
-    this.config = config;
-    this.maxRetries = config.maxRetries ?? 3;
-    this.rateLimiter = new RateLimiter();
-    this.versionManager = new ApiVersionManager();
+  constructor(options: LinkedInApiOptions = {}) {
+    this.baseUrl = options.baseUrl ?? LINKEDIN.apiBaseUrl;
+    this.maxRetries = options.maxRetries ?? 3;
+    this.fetch = options.fetch ?? globalThis.fetch;
   }
 
-  /**
-   * Make an authenticated request to the LinkedIn API with retry logic.
-   */
-  async request<T>(requestConfig: RequestConfig): Promise<T> {
-    const endpoint = `${requestConfig.method} ${requestConfig.path}`;
+  as(link: LinkedInLink): LinkedInAsMember {
+    return new LinkedInAsMember(link, this.baseUrl, this.maxRetries, this.fetch, this.quotas);
+  }
+}
 
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+export class LinkedInAsMember {
+  constructor(
+    private readonly link: LinkedInLink,
+    private readonly baseUrl: string,
+    private readonly maxRetries: number,
+    private readonly fetch: typeof globalThis.fetch,
+    private readonly quotas: RateLimiter,
+  ) {}
+
+  async request<T>(shape: RequestShape): Promise<T> {
+    const endpoint = `${shape.method} ${shape.path}`;
+    let rejectedOnce = false;
+
+    for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
       try {
-        await this.rateLimiter.waitIfNeeded(endpoint);
-        const token = await this.config.getAccessToken();
+        await this.quotas.waitIfNeeded(this.link.forQMate, endpoint);
+        // Il bearer e l'urn dell'autore vengono dallo stesso collegamento: se
+        // il token si rinnova qui, resta il token di QUESTO membro.
+        const token = await this.link.accessToken(rejectedOnce);
 
-        const url = `${this.config.baseUrl}${requestConfig.path}`;
-        const headers: Record<string, string> = {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-          ...( (requestConfig.versioned ?? true) ? this.versionManager.getHeaders() : {}),
-          ...requestConfig.headers,
-        };
-
-        const response = await fetch(url, {
-          method: requestConfig.method,
-          headers,
-          body: requestConfig.body ? JSON.stringify(requestConfig.body) : undefined,
+        const response = await this.fetch(`${this.baseUrl}${shape.path}`, {
+          method: shape.method,
+          headers: {
+            authorization: `Bearer ${token}`,
+            'content-type': 'application/json',
+            ...((shape.versioned ?? true) ? linkedInVersionHeaders() : {}),
+            ...shape.headers,
+          },
+          body: shape.body === undefined ? undefined : JSON.stringify(shape.body),
         });
 
-        this.rateLimiter.track(endpoint, response.status, response.headers);
+        this.quotas.track(this.link.forQMate, endpoint, response.status, response.headers);
 
         if (response.status === 401 && attempt < this.maxRetries) {
-          // Token might have expired mid-request
-          throw new RetryableError('Authentication expired');
+          // Il fork ripresentava lo stesso token morto: il rinnovo scattava
+          // solo sull'orologio locale, mai su un rifiuto vero.
+          rejectedOnce = true;
+          throw new RetryableError('LinkedIn ha rifiutato il token');
         }
-
         if (response.status === 429) {
           const retryAfter = response.headers.get('retry-after');
-          const delayMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : undefined;
-          throw new RetryableError('Rate limited', delayMs);
+          throw new RetryableError('quota esaurita', retryAfter ? Number(retryAfter) * 1000 : undefined);
         }
-
         if (response.status >= 500 && attempt < this.maxRetries) {
-          throw new RetryableError(`Server error: ${response.status}`);
+          throw new RetryableError(`LinkedIn ha risposto ${response.status}`);
         }
+        if (!response.ok) throw await asApiError(response);
 
-        if (!response.ok) {
-          let errorBody: LinkedInApiErrorResponse;
-          try {
-            errorBody = (await response.json()) as LinkedInApiErrorResponse;
-          } catch {
-            errorBody = { status: response.status, message: response.statusText };
-          }
-          throw LinkedInApiError.fromResponse(response.status, errorBody);
-        }
-
-        // Handle 204 No Content
-        if (response.status === 204) {
-          return undefined as T;
-        }
-
-        // Some responses return the resource ID in the header
-        const contentType = response.headers.get('content-type');
-        if (contentType?.includes('application/json')) {
-          return (await response.json()) as T;
-        }
-
-        // For non-JSON responses (e.g., image upload), return the header info
-        const resourceId = response.headers.get('x-restli-id');
-        if (resourceId) {
-          return { id: resourceId } as T;
-        }
-
-        return undefined as T;
-      } catch (error) {
-        if (error instanceof RetryableError && attempt < this.maxRetries) {
-          const delay =
-            error.retryAfterMs ?? this.rateLimiter.getBackoffDelay(attempt);
-          await new Promise((resolve) => setTimeout(resolve, delay));
+        return (await readBody<T>(response)) as T;
+      } catch (failure) {
+        if (failure instanceof RetryableError && attempt < this.maxRetries) {
+          await pause(failure.retryAfterMs ?? this.quotas.getBackoffDelay(attempt));
           continue;
         }
-        throw error;
+        throw failure;
       }
     }
-
-    throw new Error('Max retries exceeded');
+    throw new Error('LinkedIn non ha risposto entro i tentativi previsti');
   }
 
-  /**
-   * Convenience methods for common HTTP verbs.
-   */
-  async get<T>(path: string, versioned?: boolean): Promise<T> {
+  get<T>(path: string, versioned?: boolean): Promise<T> {
     return this.request<T>({ method: 'GET', path, versioned });
   }
 
-  async post<T>(path: string, body?: unknown, versioned?: boolean): Promise<T> {
+  post<T>(path: string, body?: unknown, versioned?: boolean): Promise<T> {
     return this.request<T>({ method: 'POST', path, body, versioned });
   }
 
-  async put<T>(path: string, body?: unknown): Promise<T> {
-    return this.request<T>({ method: 'PUT', path, body });
-  }
-
-  async delete<T>(path: string): Promise<T> {
+  delete<T>(path: string): Promise<T> {
     return this.request<T>({ method: 'DELETE', path });
   }
 
-  /**
-   * Upload binary data (for image uploads).
-   */
-  async uploadBinary(uploadUrl: string, data: Buffer, contentType: string): Promise<void> {
-    const token = await this.config.getAccessToken();
-
-    const response = await fetch(uploadUrl, {
+  /** Il secondo passo dell'upload: i byte vanno all'URL che LinkedIn ha indicato. */
+  async sendImageBytes(uploadUrl: string, bytes: Buffer, contentType: string): Promise<void> {
+    if (!mayReceiveUploads(uploadUrl)) {
+      throw new LinkedInApiError(0, `LinkedIn ha indicato un host di upload non previsto`);
+    }
+    const response = await this.fetch(uploadUrl, {
       method: 'PUT',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': contentType,
-      },
-      body: data,
+      headers: { authorization: `Bearer ${await this.link.accessToken()}`, 'content-type': contentType },
+      body: new Uint8Array(bytes),
     });
-
     if (!response.ok) {
-      throw new LinkedInApiError(
-        response.status,
-        `Image upload failed: ${response.statusText}`,
-      );
+      throw new LinkedInApiError(response.status, `upload dell immagine rifiutato (${response.status})`);
     }
   }
 
-  /**
-   * Get rate limit information for all tracked endpoints.
-   */
-  getRateLimitInfo() {
-    return this.rateLimiter.getAllInfo();
+  /** Le quote di questo QMate: quelle di un altro non sono affar suo. */
+  quotasSoFar(): RateLimitInfo[] {
+    return this.quotas.infoFor(this.link.forQMate);
   }
+}
+
+function mayReceiveUploads(uploadUrl: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(uploadUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:') return false;
+  return HOSTS_ALLOWED_TO_RECEIVE_UPLOADS.some(
+    (host) => parsed.hostname === host || parsed.hostname.endsWith(`.${host}`),
+  );
+}
+
+async function asApiError(response: Response): Promise<LinkedInApiError> {
+  let body: LinkedInApiErrorResponse;
+  try {
+    body = (await response.json()) as LinkedInApiErrorResponse;
+  } catch {
+    body = { status: response.status, message: response.statusText };
+  }
+  return LinkedInApiError.fromResponse(response.status, body);
+}
+
+async function readBody<T>(response: Response): Promise<T | undefined> {
+  if (response.status === 204) return undefined;
+  if (response.headers.get('content-type')?.includes('application/json')) {
+    return (await response.json()) as T;
+  }
+  // Le creazioni rendono l'id della risorsa in un header, non nel corpo.
+  const created = response.headers.get('x-restli-id');
+  return created === null ? undefined : ({ id: created } as T);
+}
+
+function pause(milliseconds: number): Promise<void> {
+  return new Promise((elapsed) => setTimeout(elapsed, milliseconds));
 }

@@ -2,6 +2,7 @@ import { randomBytes, randomInt } from 'node:crypto';
 
 import type { QMateSubject } from '../fleet/acting-qmate.js';
 import { LINKEDIN } from '../fleet/configuration.js';
+import { SELF_SERVE_SCOPES } from '../types/index.js';
 import type { LinkStore, LinkedInCredential } from './link-store.js';
 
 /**
@@ -28,9 +29,10 @@ import type { LinkStore, LinkedInCredential } from './link-store.js';
  *
  * Nel fork era un parametro del tool, castato `as never`: chi chiamava poteva
  * chiedere qualunque scope, quindi l'insieme dei permessi non era una policy
- * ma una richiesta del client.
+ * ma una richiesta del client. Sono i quattro che LinkedIn concede senza
+ * approvare l'app — gli altri del vocabolario richiedono una revisione.
  */
-const SCOPES = ['openid', 'profile', 'email', 'w_member_social'] as const;
+const SCOPES = SELF_SERVE_SCOPES;
 
 /** Senza I, O, 0 e 1: questo codice lo legge un umano da una pagina web. */
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';

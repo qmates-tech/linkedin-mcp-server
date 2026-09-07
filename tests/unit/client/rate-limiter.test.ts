@@ -1,108 +1,101 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
+
 import { RateLimiter } from '../../../src/client/rate-limiter.js';
 
-describe('RateLimiter', () => {
-  let limiter: RateLimiter;
+const FABRIZIO = '106977126509011341120';
+const ANOTHER_QMATE = '999888777666555444333';
 
+let quotas: RateLimiter;
+
+beforeEach(() => {
+  quotas = new RateLimiter();
+});
+
+function headers(values: Record<string, string> = {}): Headers {
+  return new Headers(values);
+}
+
+describe('il consumo di un QMate', () => {
+  it('parte da zero e cresce a ogni chiamata', () => {
+    quotas.track(FABRIZIO, 'POST /v2/posts', 200, headers());
+    quotas.track(FABRIZIO, 'POST /v2/posts', 200, headers());
+    expect(quotas.getInfo(FABRIZIO, 'POST /v2/posts').used).toBe(2);
+  });
+
+  it('impara il limite vero dagli header di LinkedIn', () => {
+    quotas.track(FABRIZIO, 'GET /v2/userinfo', 200, headers({
+      'x-ratelimit-limit': '500',
+      'x-ratelimit-remaining': '498',
+    }));
+    const info = quotas.getInfo(FABRIZIO, 'GET /v2/userinfo');
+    expect(info).toMatchObject({ limit: 500, used: 2 });
+  });
+
+  it('abbassa la stima quando LinkedIn risponde 429', () => {
+    for (let call = 0; call < 5; call += 1) {
+      quotas.track(FABRIZIO, 'POST /v2/posts', 200, headers());
+    }
+    quotas.track(FABRIZIO, 'POST /v2/posts', 429, headers({ 'retry-after': '60' }));
+    expect(quotas.getInfo(FABRIZIO, 'POST /v2/posts').limit).toBeLessThanOrEqual(6);
+  });
+
+  it('blocca le chiamate quando ha esaurito', () => {
+    expect(quotas.canCall(FABRIZIO, 'GET /v2/test')).toBe(true);
+    for (let call = 0; call < 80; call += 1) {
+      quotas.track(FABRIZIO, 'GET /v2/test', 200, headers());
+    }
+    expect(quotas.canCall(FABRIZIO, 'GET /v2/test')).toBe(false);
+    expect(quotas.getDelay(FABRIZIO, 'GET /v2/test')).toBeGreaterThan(0);
+  });
+});
+
+// Le quote di LinkedIn sono PER MEMBRO. Nel fork il bucket era chiavato sul
+// solo `"METODO /path"`, quindi il traffico di un QMate consumava — e faceva
+// aspettare — il budget di tutti gli altri.
+describe('due QMate non si consumano le quote a vicenda', () => {
   beforeEach(() => {
-    limiter = new RateLimiter();
+    for (let call = 0; call < 80; call += 1) {
+      quotas.track(FABRIZIO, 'POST /v2/posts', 200, headers());
+    }
   });
 
-  const mockHeaders = (overrides: Record<string, string> = {}) => {
-    return new Headers(overrides);
-  };
-
-  describe('canCall', () => {
-    it('should allow calls when under limit', () => {
-      expect(limiter.canCall('GET /v2/userinfo')).toBe(true);
-    });
-
-    it('should block calls when at limit', () => {
-      const endpoint = 'GET /v2/test';
-      // Simulate hitting the rate limit
-      for (let i = 0; i < 80; i++) {
-        limiter.track(endpoint, 200, mockHeaders());
-      }
-      expect(limiter.canCall(endpoint)).toBe(false);
-    });
+  it('chi non ha chiamato può ancora chiamare', () => {
+    expect(quotas.canCall(FABRIZIO, 'POST /v2/posts')).toBe(false);
+    expect(quotas.canCall(ANOTHER_QMATE, 'POST /v2/posts')).toBe(true);
+    expect(quotas.getDelay(ANOTHER_QMATE, 'POST /v2/posts')).toBe(0);
   });
 
-  describe('track', () => {
-    it('should update usage count on each call', () => {
-      const endpoint = 'POST /v2/posts';
-      limiter.track(endpoint, 200, mockHeaders());
-      limiter.track(endpoint, 200, mockHeaders());
+  it('e non legge i conteggi dell altro', () => {
+    expect(quotas.infoFor(ANOTHER_QMATE)).toEqual([]);
+    expect(quotas.infoFor(FABRIZIO)).toEqual([
+      expect.objectContaining({ endpoint: 'POST /v2/posts', used: 80 }),
+    ]);
+  });
+});
 
-      const info = limiter.getInfo(endpoint);
-      expect(info.used).toBe(2);
-    });
-
-    it('should learn limits from response headers', () => {
-      const endpoint = 'GET /v2/userinfo';
-      limiter.track(
-        endpoint,
-        200,
-        mockHeaders({
-          'x-ratelimit-limit': '500',
-          'x-ratelimit-remaining': '498',
-        }),
-      );
-
-      const info = limiter.getInfo(endpoint);
-      expect(info.limit).toBe(500);
-      expect(info.used).toBe(2); // 500 - 498
-    });
-
-    it('should adjust limit on 429 response', () => {
-      const endpoint = 'POST /v2/posts';
-      // Make some calls first
-      for (let i = 0; i < 5; i++) {
-        limiter.track(endpoint, 200, mockHeaders());
-      }
-      // Simulate a 429
-      limiter.track(endpoint, 429, mockHeaders({ 'retry-after': '60' }));
-
-      const info = limiter.getInfo(endpoint);
-      expect(info.limit).toBeLessThanOrEqual(6); // Should be reduced
-    });
+describe('l elenco delle proprie quote', () => {
+  it('nomina gli endpoint chiamati, senza il subject davanti', () => {
+    quotas.track(FABRIZIO, 'GET /v2/userinfo', 200, headers());
+    quotas.track(FABRIZIO, 'POST /v2/posts', 201, headers());
+    expect(quotas.infoFor(FABRIZIO).map((quota) => quota.endpoint).sort()).toEqual([
+      'GET /v2/userinfo',
+      'POST /v2/posts',
+    ]);
   });
 
-  describe('getDelay', () => {
-    it('should return 0 when under limit', () => {
-      expect(limiter.getDelay('GET /v2/userinfo')).toBe(0);
-    });
+  it('è vuoto finché non si è chiamato niente', () => {
+    expect(quotas.infoFor(FABRIZIO)).toEqual([]);
+  });
+});
+
+describe('il backoff fra i tentativi', () => {
+  it('cresce a ogni tentativo', () => {
+    const delays = [0, 1, 2].map((attempt) => quotas.getBackoffDelay(attempt));
+    expect(delays[1]).toBeGreaterThan(delays[0]!);
+    expect(delays[2]).toBeGreaterThan(delays[1]!);
   });
 
-  describe('getBackoffDelay', () => {
-    it('should increase exponentially', () => {
-      const d0 = limiter.getBackoffDelay(0);
-      const d1 = limiter.getBackoffDelay(1);
-      const d2 = limiter.getBackoffDelay(2);
-
-      // Each should be roughly double (with jitter)
-      expect(d1).toBeGreaterThan(d0);
-      expect(d2).toBeGreaterThan(d1);
-    });
-
-    it('should cap at 60 seconds', () => {
-      const delay = limiter.getBackoffDelay(100);
-      expect(delay).toBeLessThanOrEqual(60500); // 60000 + max jitter
-    });
-  });
-
-  describe('getAllInfo', () => {
-    it('should return info for all tracked endpoints', () => {
-      limiter.track('GET /v2/userinfo', 200, mockHeaders());
-      limiter.track('POST /v2/posts', 201, mockHeaders());
-
-      const allInfo = limiter.getAllInfo();
-      expect(allInfo).toHaveLength(2);
-      expect(allInfo.map((i) => i.endpoint)).toContain('GET /v2/userinfo');
-      expect(allInfo.map((i) => i.endpoint)).toContain('POST /v2/posts');
-    });
-
-    it('should return empty array when no calls made', () => {
-      expect(limiter.getAllInfo()).toEqual([]);
-    });
+  it('non supera il minuto', () => {
+    expect(quotas.getBackoffDelay(100)).toBeLessThanOrEqual(60_500);
   });
 });

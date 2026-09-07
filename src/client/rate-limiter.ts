@@ -1,7 +1,14 @@
 /**
- * Adaptive rate limiter for LinkedIn API.
- * Tracks usage per endpoint using response headers and learned limits from 429s.
- * LinkedIn rate limits are per 24-hour window, resetting at midnight UTC.
+ * Il consumo delle quote LinkedIn, per QMate e per endpoint.
+ *
+ * Le quote di LinkedIn sono PER MEMBRO, quindi un contatore condiviso fra tutti
+ * i QMate sbaglia due volte: riporta numeri che non sono quelli di nessuno, e
+ * `waitIfNeeded` fa aspettare un QMate sul budget consumato da un altro. Nel
+ * fork il bucket era chiavato sul solo `"METODO /path"` — un limitatore per
+ * processo, in un servizio multi-tenant.
+ *
+ * I limiti si imparano dagli header di risposta e dai 429; la finestra è di 24
+ * ore e si azzera a mezzanotte UTC.
  */
 
 export interface RateLimitInfo {
@@ -28,8 +35,8 @@ export class RateLimiter {
    * Track a response to update rate limit counters.
    * Extracts limits from LinkedIn response headers when available.
    */
-  track(endpoint: string, status: number, headers: Headers): void {
-    const bucket = this.getOrCreateBucket(endpoint);
+  track(caller: string, endpoint: string, status: number, headers: Headers): void {
+    const bucket = this.getOrCreateBucket(bucketFor(caller, endpoint));
     bucket.used++;
     bucket.lastUpdated = Date.now();
 
@@ -62,8 +69,8 @@ export class RateLimiter {
   /**
    * Check if we can make a call to this endpoint.
    */
-  canCall(endpoint: string): boolean {
-    const bucket = this.getOrCreateBucket(endpoint);
+  canCall(caller: string, endpoint: string): boolean {
+    const bucket = this.getOrCreateBucket(bucketFor(caller, endpoint));
     this.resetIfExpired(bucket);
     return bucket.used < bucket.limit;
   }
@@ -71,8 +78,8 @@ export class RateLimiter {
   /**
    * Get current rate limit info for an endpoint.
    */
-  getInfo(endpoint: string): RateLimitInfo {
-    const bucket = this.getOrCreateBucket(endpoint);
+  getInfo(caller: string, endpoint: string): RateLimitInfo {
+    const bucket = this.getOrCreateBucket(bucketFor(caller, endpoint));
     this.resetIfExpired(bucket);
     return {
       endpoint,
@@ -83,26 +90,32 @@ export class RateLimiter {
   }
 
   /**
-   * Get rate limit info for all tracked endpoints.
+   * Quanto ha consumato QUESTO QMate.
+   *
+   * Il fork rendeva i bucket di tutti: un conteggio aggregato dell'attività
+   * della flotta, leggibile da chiunque avesse una sessione.
    */
-  getAllInfo(): RateLimitInfo[] {
-    return Array.from(this.buckets.entries()).map(([endpoint, bucket]) => {
-      this.resetIfExpired(bucket);
-      return {
-        endpoint,
-        used: bucket.used,
-        limit: bucket.limit,
-        resetAt: bucket.resetAt,
-      };
-    });
+  infoFor(caller: string): RateLimitInfo[] {
+    const mine = `${caller}\u0000`;
+    return Array.from(this.buckets.entries())
+      .filter(([key]) => key.startsWith(mine))
+      .map(([key, bucket]) => {
+        this.resetIfExpired(bucket);
+        return {
+          endpoint: key.slice(mine.length),
+          used: bucket.used,
+          limit: bucket.limit,
+          resetAt: bucket.resetAt,
+        };
+      });
   }
 
   /**
    * Calculate delay (ms) if we need to wait before calling.
    * Returns 0 if we can call immediately.
    */
-  getDelay(endpoint: string): number {
-    const bucket = this.getOrCreateBucket(endpoint);
+  getDelay(caller: string, endpoint: string): number {
+    const bucket = this.getOrCreateBucket(bucketFor(caller, endpoint));
     this.resetIfExpired(bucket);
 
     if (bucket.used < bucket.limit) return 0;
@@ -112,8 +125,8 @@ export class RateLimiter {
   /**
    * Wait if necessary before making a call.
    */
-  async waitIfNeeded(endpoint: string): Promise<void> {
-    const delay = this.getDelay(endpoint);
+  async waitIfNeeded(caller: string, endpoint: string): Promise<void> {
+    const delay = this.getDelay(caller, endpoint);
     if (delay > 0) {
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
@@ -127,8 +140,8 @@ export class RateLimiter {
     return Math.min(BACKOFF_BASE_MS * Math.pow(2, attempt) + jitter, 60000);
   }
 
-  private getOrCreateBucket(endpoint: string): EndpointBucket {
-    let bucket = this.buckets.get(endpoint);
+  private getOrCreateBucket(key: string): EndpointBucket {
+    let bucket = this.buckets.get(key);
     if (!bucket) {
       bucket = {
         used: 0,
@@ -136,7 +149,7 @@ export class RateLimiter {
         resetAt: this.getNextMidnightUtc(),
         lastUpdated: Date.now(),
       };
-      this.buckets.set(endpoint, bucket);
+      this.buckets.set(key, bucket);
     }
     return bucket;
   }
@@ -158,4 +171,9 @@ export class RateLimiter {
     ));
     return midnight.getTime();
   }
+}
+
+/** Il byte nullo non compare né in un subject né in un path: separa senza ambiguità. */
+function bucketFor(caller: string, endpoint: string): string {
+  return `${caller}\u0000${endpoint}`;
 }

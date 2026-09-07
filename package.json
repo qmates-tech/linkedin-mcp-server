@@ -1,13 +1,10 @@
 {
   "name": "linkedin-mcp-server",
   "version": "0.1.0",
-  "description": "A Model Context Protocol server for LinkedIn's official API",
+  "description": "mcp-linkedin: the LinkedIn resource server of the QMates MCP fleet",
   "type": "module",
   "engines": {
     "node": ">=20.0.0"
-  },
-  "bin": {
-    "linkedin-mcp-server": "./dist/index.js"
   },
   "scripts": {
     "build": "tsc",
@@ -20,7 +17,8 @@
     "lint:fix": "eslint src/ tests/ --fix",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "parity": "python3 scripts/audience-parity.py"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
@@ -47,8 +45,8 @@
     "mcp",
     "linkedin",
     "model-context-protocol",
-    "ai",
-    "oauth"
+    "oauth",
+    "qmates-fleet"
   ],
   "license": "MIT",
   "files": [

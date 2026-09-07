@@ -52,7 +52,8 @@ export class LinkedInLinks {
 
 export class LinkedInLink {
   constructor(
-    private readonly qmate: QMateSubject,
+    /** Pubblico perché le quote di LinkedIn sono per membro: il contatore va chiavato qui. */
+    readonly forQMate: QMateSubject,
     private readonly store: LinkStore,
     private readonly linking: Linking,
     private readonly renewalsInFlight: Map<string, Promise<string>>,
@@ -60,12 +61,12 @@ export class LinkedInLink {
   ) {}
 
   state(): LinkState {
-    const readout = this.store.linkOf(this.qmate, this.now());
+    const readout = this.store.linkOf(this.forQMate, this.now());
     if (readout.kind === 'linked') return { kind: 'linked', summary: readout.summary };
     if (readout.kind === 'unreadable') {
       return { kind: 'unreadable', linkedInMemberId: readout.linkedInMemberId };
     }
-    const pending = this.linking.awaitingConfirmation(this.qmate);
+    const pending = this.linking.awaitingConfirmation(this.forQMate);
     return pending === null
       ? { kind: 'absent' }
       : { kind: 'awaiting_confirmation', linkedInMemberId: pending.linkedInMemberId };
@@ -73,7 +74,7 @@ export class LinkedInLink {
 
   /** L'urn con cui LinkedIn attribuisce ciò che pubblichiamo. */
   personUrn(): string {
-    const readout = this.store.linkOf(this.qmate, this.now());
+    const readout = this.store.linkOf(this.forQMate, this.now());
     if (readout.kind !== 'linked') throw new NotLinked();
     return `urn:li:person:${readout.summary.linkedInMemberId}`;
   }
@@ -86,7 +87,7 @@ export class LinkedInLink {
    * il rinnovo scattava solo sull'orologio locale, mai su un rifiuto vero.
    */
   async accessToken(afterRejection = false): Promise<string> {
-    const readout = this.store.linkOf(this.qmate, this.now());
+    const readout = this.store.linkOf(this.forQMate, this.now());
     if (readout.kind === 'absent') throw new NotLinked();
     if (readout.kind === 'unreadable') {
       throw new NotLinked('La chiave di cifratura non apre più il tuo collegamento: ricollega con linkedin_link_start.');
@@ -105,27 +106,27 @@ export class LinkedInLink {
    * tenessimo il collegamento, un QMate non potrebbe più staccarsi.
    */
   async forget(): Promise<{ revoked: boolean }> {
-    const readout = this.store.linkOf(this.qmate, this.now());
+    const readout = this.store.linkOf(this.forQMate, this.now());
     const grant = readout.kind === 'linked' ? (readout.refreshToken ?? readout.accessToken) : null;
     const revoked = grant === null ? false : await this.linking.revoke(grant);
-    this.store.forgetLink(this.qmate);
+    this.store.forgetLink(this.forQMate);
     return { revoked };
   }
 
   private async renewOnce(refreshToken: string): Promise<string> {
-    const alreadyRunning = this.renewalsInFlight.get(this.qmate);
+    const alreadyRunning = this.renewalsInFlight.get(this.forQMate);
     if (alreadyRunning) return alreadyRunning;
 
     const renewal = this.linking
       .renew(refreshToken)
       .then((renewed) => {
         if (renewed === null) throw new LinkNoLongerValid();
-        this.store.renewCredential(this.qmate, renewed);
+        this.store.renewCredential(this.forQMate, renewed);
         return renewed.accessToken;
       })
-      .finally(() => this.renewalsInFlight.delete(this.qmate));
+      .finally(() => this.renewalsInFlight.delete(this.forQMate));
 
-    this.renewalsInFlight.set(this.qmate, renewal);
+    this.renewalsInFlight.set(this.forQMate, renewal);
     return renewal;
   }
 }
