@@ -2,7 +2,7 @@
 # Apparecchia l'Environment `production` di mcp-linkedin, sui due repo che
 # devono combaciare.
 #
-#   ./scripts/provision-production.sh
+#   ./scripts/provision-production.sh [percorso-del-file]     (default: envs.txt)
 #
 # I DUE SEGRETI CONDIVISI LI GENERA LO SCRIPT, e li deposita in entrambi i posti
 # nello stesso giro. È il rimedio al problema vero: un secret di GitHub, una
@@ -11,10 +11,16 @@
 # finisce in una chat o in un file. Qui il valore non compare mai: né a schermo,
 # né in un file, né nella storia della shell.
 #
-# Il client id e il client secret dell'app LinkedIn li chiede a te, senza
-# stamparli. Tutto è idempotente: rilanciarlo rigenera i segreti generati e
+# Il client id e il client secret dell'app LinkedIn li legge da un file di righe
+# `CHIAVE=valore` — non da un prompt, che pretende un TTY e non c'è quando lo
+# script parte da una shell non interattiva. Il file NON viene stampato e NON
+# deve stare in git: lo script si ferma se è tracciato.
+#
+# Tutto è idempotente: rilanciarlo rigenera i due segreti che genera lui e
 # lascia stare il resto.
 set -euo pipefail
+
+CREDENTIALS_FILE="${1:-envs.txt}"
 
 LINKEDIN_REPO="qmates-tech/linkedin-mcp-server"
 AUTH_REPO="qmates-tech/qmates-auth-server"
@@ -76,20 +82,6 @@ printf '%s' "$(openssl rand -base64 32)" \
   | gh secret set QLI_TOKEN_KEY --env "${ENVIRONMENT}" -R "${LINKEDIN_REPO}"
 echo "  QLI_TOKEN_KEY → ${LINKEDIN_REPO}"
 
-say "le credenziali dell'app LinkedIn aziendale"
-echo "Dal pannello LinkedIn Developers → la tua app → Auth."
-echo "Non vengono stampate, non finiscono in un file, non restano nella storia della shell."
-read -rsp "  client id     : " linkedin_client_id; echo
-read -rsp "  client secret : " linkedin_client_secret; echo
-[ -n "${linkedin_client_id}" ] || fatale "il client id è vuoto"
-[ -n "${linkedin_client_secret}" ] || fatale "il client secret è vuoto"
-printf '%s' "${linkedin_client_id}" \
-  | gh secret set QLI_LINKEDIN_CLIENT_ID --env "${ENVIRONMENT}" -R "${LINKEDIN_REPO}"
-printf '%s' "${linkedin_client_secret}" \
-  | gh secret set QLI_LINKEDIN_CLIENT_SECRET --env "${ENVIRONMENT}" -R "${LINKEDIN_REPO}"
-unset linkedin_client_id linkedin_client_secret
-echo "  depositate"
-
 say "le due variabili (non sono segreti: si rileggono)"
 gh variable set QLI_RESOURCE_URL --env "${ENVIRONMENT}" -R "${LINKEDIN_REPO}" --body "${RESOURCE_URL}"
 gh variable set QLI_AS_URL --env "${ENVIRONMENT}" -R "${LINKEDIN_REPO}" --body "${AS_URL}"
@@ -117,6 +109,50 @@ else
   # che riesce, ma a ogni chiamata successiva con un 401.
   echo "  MANCA ${RESOURCE_URL} in QAS_AUDIENCES (ora: ${audiences:-vuota})"
   echo "  aggiungila a mano, poi redeploya l'AS"
+fi
+
+say "le credenziali dell'app LinkedIn aziendale"
+if [ ! -f "${CREDENTIALS_FILE}" ]; then
+  echo "  ${CREDENTIALS_FILE} non c'è: le due credenziali restano da depositare."
+  echo "  Scrivi un file così (una riga per credenziale, niente virgolette):"
+  echo "    QLI_LINKEDIN_CLIENT_ID=..."
+  echo "    QLI_LINKEDIN_CLIENT_SECRET=..."
+  echo "  poi rilancia. Tutto il resto è già a posto."
+else
+  # In git quel file sarebbe il client secret dell'app aziendale dentro la
+  # storia del repo, da cui non si toglie con una `rm`.
+  if git ls-files --error-unmatch "${CREDENTIALS_FILE}" >/dev/null 2>&1; then
+    fatale "${CREDENTIALS_FILE} è TRACCIATO da git: toglilo dall'indice prima di usarlo (git rm --cached)"
+  fi
+  mode="$(stat -f '%Lp' "${CREDENTIALS_FILE}" 2>/dev/null || stat -c '%a' "${CREDENTIALS_FILE}")"
+  case "${mode}" in
+    *00) ;;
+    *) echo "  attenzione: ${CREDENTIALS_FILE} è leggibile da altri (${mode}); chmod 600";;
+  esac
+
+  # Lettura riga per riga, taglio al PRIMO `=`: un valore può contenerne altri.
+  # `$'\r'` via: un file passato da Windows o da un incolla porta il ritorno a
+  # capo dentro il valore, e il segreto arriverebbe diverso di un byte.
+  deposita_da_file() {
+    local chiave="$1" valore
+    valore="$(sed -n "s/^${chiave}=//p" "${CREDENTIALS_FILE}" | head -1 | tr -d '\r')"
+    if [ -z "${valore}" ]; then
+      echo "  MANCA ${chiave} in ${CREDENTIALS_FILE}"
+      return 1
+    fi
+    printf '%s' "${valore}" | gh secret set "${chiave}" --env "${ENVIRONMENT}" -R "${LINKEDIN_REPO}"
+    echo "  ${chiave} → ${LINKEDIN_REPO}"
+  }
+  # `|| mancante=1` e non la chiamata nuda: con `set -e` una chiave vuota
+  # ucciderebbe lo script e la coda non girerebbe mai.
+  mancante=0
+  deposita_da_file QLI_LINKEDIN_CLIENT_ID || mancante=1
+  deposita_da_file QLI_LINKEDIN_CLIENT_SECRET || mancante=1
+  if [ "${mancante}" = 1 ]; then
+    echo "  riempi le chiavi mancanti in ${CREDENTIALS_FILE} e rilancia"
+  else
+    echo "  ora cancella ${CREDENTIALS_FILE}: i segreti vivono nell'Environment, non su disco"
+  fi
 fi
 
 say "cosa resta, e lo fa una persona"

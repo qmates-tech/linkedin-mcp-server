@@ -35,3 +35,8 @@ coverage/
 
 # LinkedIn MCP data directory
 .linkedin-mcp/
+
+# Le credenziali che provision-production.sh legge: il client secret dell app
+# aziendale. Vivono nell Environment, non su disco, e meno che mai in git —
+# da cui non si toglierebbero con una rm.
+envs.txt
